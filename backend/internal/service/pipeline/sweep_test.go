@@ -83,7 +83,7 @@ func newNoticeEnv(t *testing.T, stage domain.PipelineStage) *noticeEnv {
 	}
 	svc, err := New(Deps{
 		Sessions: w, Gates: w, Projects: w, PRFacts: w, Heads: w,
-		Runner: w, Notifier: notices, Clock: w, NewID: w.newID,
+		Runner: w, Git: w, Notifier: notices, Clock: w, NewID: w.newID,
 	})
 	if err != nil {
 		t.Fatal(err)

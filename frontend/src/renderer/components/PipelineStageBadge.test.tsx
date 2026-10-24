@@ -30,6 +30,13 @@ describe("PipelineStageBadge", () => {
 		expect(screen.getByLabelText("Pipeline stage: Validating, attempt 2 of 3")).toBeInTheDocument();
 	});
 
+	it("falls back to the raw stage for an unknown future stage", () => {
+		renderBadge({ ...base, stage: "archiving" as SessionPipeline["stage"] });
+		expect(screen.getByRole("status")).toHaveTextContent("archiving");
+		expect(screen.getByRole("status")).not.toHaveTextContent("shell.pipelineStage");
+		expect(screen.getByLabelText("Pipeline stage: archiving")).toBeInTheDocument();
+	});
+
 	it("shows an escalated badge with an accessible label and a focusable evidence tooltip", () => {
 		renderBadge({
 			...base,

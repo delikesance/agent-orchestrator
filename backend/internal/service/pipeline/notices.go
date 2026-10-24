@@ -27,6 +27,9 @@ const (
 	NoticeReviewChangesRequested NoticeKind = "review_changes_requested"
 	NoticeTaskReady              NoticeKind = "task_ready"
 	NoticeEscalated              NoticeKind = "escalated"
+	// NoticeNoDeliverable: a task finished with no code changes or with an
+	// artifact; it was un-enrolled instead of validated.
+	NoticeNoDeliverable NoticeKind = "no_deliverable"
 	// NoticeStageStuck is sweep-only: a stage made no progress for too long.
 	NoticeStageStuck NoticeKind = "stage_stuck"
 )
@@ -108,7 +111,7 @@ func (n *Notices) Notify(ctx context.Context, notice Notice) error {
 	case notice.To == domain.PipelineStageEscalated:
 		errs = append(errs, n.send(ctx, rec, notice, NoticeEscalated, escalatedText(rec, notice), true))
 		if n.d.Users != nil {
-			if err := n.d.Users.PipelineEscalated(ctx, rec, notice.Reason, notice.Attempt, notice.MaxAttempts); err != nil {
+			if err := n.d.Users.PipelineEscalated(ctx, rec, redactReason(notice.Reason, nil), notice.Attempt, notice.MaxAttempts); err != nil {
 				errs = append(errs, fmt.Errorf("escalation notification: %w", err))
 			}
 		}
@@ -189,7 +192,7 @@ func changesRequestedText(rec domain.SessionRecord, notice Notice) string {
 }
 
 func escalatedText(rec domain.SessionRecord, notice Notice) string {
-	reason := strings.TrimSpace(notice.Reason)
+	reason := redactReason(notice.Reason, nil)
 	if reason == "" {
 		reason = "escalated"
 	}

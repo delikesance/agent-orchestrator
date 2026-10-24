@@ -10,6 +10,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 )
 
@@ -75,6 +76,47 @@ func TestSessionsAPI_SpawnParentIsBoundToVerifiedCaller(t *testing.T) {
 		}
 		if svc.lastSpawn.ParentVerified || svc.lastSpawn.ParentSessionID != "ao-1" {
 			t.Fatalf("%s: parent %q verified %v, want ao-1 unverified", name, svc.lastSpawn.ParentSessionID, svc.lastSpawn.ParentVerified)
+		}
+	}
+}
+
+func TestSessionsAPI_SpawnWithoutParentIsForcedToTheVerifiedCaller(t *testing.T) {
+	svc := newFakeSessionService()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	deps := httpd.APIDeps{Sessions: svc, SessionSecret: parentAuthSecret}
+	srv := httptest.NewServer(httpd.NewRouterWithControl(config.Config{}, log, nil, deps, httpd.ControlDeps{}))
+	t.Cleanup(srv.Close)
+	const worker = `{"projectId":"ao","kind":"worker","harness":"claude-code","prompt":"fix"}`
+	const orchestrator = `{"projectId":"ao","kind":"orchestrator","harness":"claude-code"}`
+
+	// A raw spawn that leaves the parent out must not escape the pipeline: the
+	// verified caller becomes the parent, so the manager enrols the worker.
+	svc.lastSpawn = ports.SpawnConfig{}
+	if status := postSpawnAs(t, srv, "ao-1", sessionauth.Issue(parentAuthSecret, "ao-1"), worker); status != http.StatusCreated {
+		t.Fatalf("verified raw spawn status = %d, want 201", status)
+	}
+	if svc.lastSpawn.ParentSessionID != "ao-1" || !svc.lastSpawn.ParentVerified {
+		t.Fatalf("verified raw spawn = parent %q verified %v, want forced ao-1 verified", svc.lastSpawn.ParentSessionID, svc.lastSpawn.ParentVerified)
+	}
+
+	// Only workers are enrolled, so only a worker spawn gets a forced parent.
+	svc.lastSpawn = ports.SpawnConfig{}
+	if status := postSpawnAs(t, srv, "ao-1", sessionauth.Issue(parentAuthSecret, "ao-1"), orchestrator); status != http.StatusCreated {
+		t.Fatalf("verified orchestrator spawn status = %d, want 201", status)
+	}
+	if svc.lastSpawn.ParentSessionID != "" {
+		t.Fatalf("an orchestrator spawn got a forced parent %q", svc.lastSpawn.ParentSessionID)
+	}
+
+	// The default (non-strict) behaviour for everyone else is unchanged: a human
+	// and a claimed-unverified caller leave the parent empty.
+	for name, hdr := range map[string][2]string{"human": {"", ""}, "claim only": {"ao-1", ""}} {
+		svc.lastSpawn = ports.SpawnConfig{}
+		if status := postSpawnAs(t, srv, hdr[0], hdr[1], worker); status != http.StatusCreated {
+			t.Fatalf("%s: status = %d, want 201", name, status)
+		}
+		if svc.lastSpawn.ParentSessionID != "" || svc.lastSpawn.ParentVerified {
+			t.Fatalf("%s: parent %q verified %v, want none", name, svc.lastSpawn.ParentSessionID, svc.lastSpawn.ParentVerified)
 		}
 	}
 }

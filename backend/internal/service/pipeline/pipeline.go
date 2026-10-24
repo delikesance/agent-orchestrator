@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -111,6 +112,9 @@ type Deps struct {
 	PRFacts  PRFactsReader
 	Heads    HeadResolver
 	Runner   CommandRunner
+	// Git reads the session worktree's HEAD and status before validation runs;
+	// the default is GitCLI.
+	Git GitState
 	// Children lists a parent's spawned sessions for the nested-children rule;
 	// when nil the Sessions store is used if it can list children, else the rule
 	// is not enforced.
@@ -146,6 +150,9 @@ func New(d Deps) (*Service, error) {
 		if c, ok := d.Sessions.(ChildStore); ok {
 			d.Children = c
 		}
+	}
+	if d.Git == nil {
+		d.Git = GitCLI{}
 	}
 	if d.Notifier == nil {
 		d.Notifier = nopNotifier{}
@@ -335,6 +342,9 @@ func (s *Service) Advance(ctx context.Context, id domain.SessionID, ev domain.Pi
 
 // escalate parks a session with a reason the notifier carries.
 func (s *Service) escalate(ctx context.Context, id domain.SessionID, reason string) (AdvanceResult, error) {
+	// The reason reaches the orchestrator, the user and the logs: keep it free
+	// of secrets and short, whoever built it.
+	reason = redactReason(reason, nil)
 	unlock := s.locks.lock(id)
 	res, notice, err := s.advance(ctx, id, domain.PipelineEventEscalate, domain.PipelineGate{}, reason)
 	unlock()
@@ -342,6 +352,43 @@ func (s *Service) escalate(ctx context.Context, id domain.SessionID, reason stri
 		_ = s.d.Notifier.Notify(ctx, *notice)
 	}
 	return res, err
+}
+
+// markMergedExternally moves an enforced, not yet merged session to merged
+// because its PR was merged outside the pipeline (for example in the GitHub UI)
+// while it was building, validating, in review, escalated or ready without
+// matching gates. The merge already happened, so no gate is required and none
+// is recorded: the gate model has no neutral result (override counts as
+// passing), so the bypass is the Warn log here plus the committed transition
+// notice (event merged, from the skipped stage) every Notifier receives.
+// Advance and domain.NextStage keep their rules; this is the only path that
+// reaches merged without a ready stage. It reports whether the stage moved.
+func (s *Service) markMergedExternally(ctx context.Context, id domain.SessionID) (bool, error) {
+	unlock := s.locks.lock(id)
+	rec, cfg, err := s.load(ctx, id)
+	if err != nil {
+		unlock()
+		return false, err
+	}
+	cur := rec.PipelineStage
+	if !cur.Enforced() || cur == domain.PipelineStageMerged {
+		unlock()
+		return false, nil
+	}
+	applied, err := s.d.Sessions.UpdatePipelineStage(ctx, id, cur, domain.PipelineStageMerged, rec.PipelineAttempt)
+	unlock()
+	if err != nil {
+		return false, err
+	}
+	if !applied {
+		return false, fmt.Errorf("%w: %s merged externally, left %q", ErrConcurrentAdvance, id, cur)
+	}
+	slog.Warn("pipeline: PR merged outside the pipeline (bypass), session marked merged", "session", id, "from", cur, "attempt", rec.PipelineAttempt)
+	_ = s.d.Notifier.Notify(ctx, Notice{
+		SessionID: id, Event: domain.PipelineEventMerged, From: cur, To: domain.PipelineStageMerged,
+		Attempt: rec.PipelineAttempt, MaxAttempts: cfg.MaxAttempts, Mode: cfg.Enforce,
+	})
+	return true, nil
 }
 
 // OnHeadChanged demotes a ready session to building when its head moved off the

@@ -2,6 +2,7 @@ package sessionmanager
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -55,6 +56,23 @@ func TestSessionTokenEnvOmittedWithoutSecretAndNotProjectSettable(t *testing.T) 
 	env = m.runtimeEnv("mer-1", "mer", "", map[string]string{EnvSessionToken: "forged"})
 	if !sessionauth.Verify(testSessionSecret, "mer-1", env[EnvSessionToken]) {
 		t.Fatalf("project env overrode the session token: %q", env[EnvSessionToken])
+	}
+}
+
+func TestWorkerEnvNeverCarriesReviewToken(t *testing.T) {
+	m, _, rt, _ := newManager()
+	m.sessionSecret = testSessionSecret
+	env := m.runtimeEnv("mer-1", "mer", "", map[string]string{sessionauth.EnvReviewToken: "forged", "ao_review_token": "forged"})
+	for key := range env {
+		if strings.EqualFold(key, sessionauth.EnvReviewToken) {
+			t.Fatalf("worker env carries %s: %v", key, env)
+		}
+	}
+	if _, err := nestedSpawn(t, m, "", ""); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if v, ok := rt.lastCfg.Env[sessionauth.EnvReviewToken]; ok {
+		t.Fatalf("worker launch env carries %s = %q", sessionauth.EnvReviewToken, v)
 	}
 }
 

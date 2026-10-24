@@ -203,11 +203,15 @@ func (c *commandContext) doJSONPathWithHeadersAndTimeout(
 	if sideID := os.Getenv("AO_SIDE_CONVERSATION_ID"); sideID != "" {
 		req.Header.Set("X-AO-Side-Conversation", sideID)
 	}
-	// Prove which session is calling. The daemon never rejects on these; it
-	// only marks the caller verified (see package sessionauth).
-	if sessionID, token := strings.TrimSpace(os.Getenv("AO_SESSION_ID")), strings.TrimSpace(os.Getenv(sessionauth.EnvSessionToken)); sessionID != "" && token != "" {
+	// Name the calling session whenever there is one, and prove it when the
+	// token is present. The middleware only marks the caller verified or
+	// claimed; sending the id without a token is deliberate, so a session that
+	// lost its token reads as an untrusted agent rather than as a human.
+	if sessionID := strings.TrimSpace(os.Getenv("AO_SESSION_ID")); sessionID != "" {
 		req.Header.Set(sessionauth.HeaderSession, sessionID)
-		req.Header.Set(sessionauth.HeaderSessionToken, token)
+		if token := strings.TrimSpace(os.Getenv(sessionauth.EnvSessionToken)); token != "" {
+			req.Header.Set(sessionauth.HeaderSessionToken, token)
+		}
 	}
 
 	// Reuse the injected client's transport (keeps it stubbable in tests) but

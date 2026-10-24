@@ -38,6 +38,15 @@ const (
 	HeaderSession = "X-AO-Session"
 	// HeaderSessionToken carries the proof for HeaderSession.
 	HeaderSessionToken = "X-AO-Session-Token" //nolint:gosec // Header name, not a credential.
+	// EnvReviewToken is the environment variable only a reviewer pane carries:
+	// the proof that a review submission comes from the reviewer AO launched.
+	EnvReviewToken = "AO_REVIEW_TOKEN" //nolint:gosec // Environment variable name, not a credential.
+	// HeaderReviewToken carries EnvReviewToken on a review submission.
+	HeaderReviewToken = "X-AO-Review-Token" //nolint:gosec // Header name, not a credential.
+
+	// reviewDomain separates review tokens from session tokens: the NUL byte
+	// cannot occur in a session id, so no session token equals a review token.
+	reviewDomain = "review\x00"
 
 	secretFileName = "session-auth.key"
 	secretBytes    = 32
@@ -58,6 +67,30 @@ func Issue(secret []byte, sessionID string) string {
 // comparison is constant time.
 func Verify(secret []byte, sessionID, token string) bool {
 	want := Issue(secret, sessionID)
+	if want == "" || token == "" {
+		return false
+	}
+	return hmac.Equal([]byte(want), []byte(token))
+}
+
+// IssueReview returns the token for the reviewer of reviewID (the review row
+// id, AO_REVIEW_SESSION_ID): base64url(HMAC-SHA256(secret, "review\x00"+id)).
+// One review row serves every run of its worker, across relaunches and queued
+// runs, so the token is keyed on the row, not on a single run. An empty secret
+// or id yields an empty token, which never verifies.
+func IssueReview(secret []byte, reviewID string) string {
+	if len(secret) == 0 || reviewID == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(reviewDomain + reviewID))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// VerifyReview reports whether token is the token IssueReview produces for
+// reviewID. The comparison is constant time.
+func VerifyReview(secret []byte, reviewID, token string) bool {
+	want := IssueReview(secret, reviewID)
 	if want == "" || token == "" {
 		return false
 	}
@@ -160,8 +193,8 @@ var (
 
 // DaemonSecret returns the secret for dataDir, loading it once per process so
 // the HTTP layer and the session manager always share one value. When the file
-// cannot be used it logs a warning and falls back to a process-local random
-// secret: tokens then stay valid for this daemon run only.
+// cannot be used it logs once, at Error level, and falls back to a process-local
+// random secret: tokens then stay valid for this daemon run only.
 func DaemonSecret(dataDir string, log *slog.Logger) []byte {
 	secretMu.Lock()
 	defer secretMu.Unlock()
@@ -171,7 +204,8 @@ func DaemonSecret(dataDir string, log *slog.Logger) []byte {
 	secret, err := LoadOrCreateSecret(dataDir)
 	if err != nil {
 		if log != nil {
-			log.Warn("session auth secret unavailable; using a process-local secret", "error", err)
+			log.Error("session auth secret file is unusable: using a process-local secret, so session and review identity will NOT survive a daemon restart (running sessions lose their tokens)",
+				"path", SecretPath(dataDir), "error", err)
 		}
 		if secret, err = NewSecret(); err != nil {
 			secret = nil
@@ -188,7 +222,15 @@ type Caller struct {
 	// Verified is true only when the request carried a token that proves
 	// SessionID under the daemon secret.
 	Verified bool
+	// Claimed is true when the request named a session (X-AO-Session) without
+	// proving it: the token is missing or wrong. Humans in the desktop UI never
+	// send the header, so Claimed marks an agent that failed to authenticate.
+	Claimed bool
 }
+
+// Untrusted reports a caller that claimed a session it could not prove. Rules
+// that trust "not a session" (a human) must refuse it.
+func (c Caller) Untrusted() bool { return c.Claimed && !c.Verified }
 
 type callerKey struct{}
 
@@ -212,12 +254,15 @@ func Middleware(secret []byte, log *slog.Logger) func(http.Handler) http.Handler
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			caller := Caller{SessionID: strings.TrimSpace(r.Header.Get(HeaderSession))}
 			token := strings.TrimSpace(r.Header.Get(HeaderSessionToken))
-			if caller.SessionID != "" && token != "" {
-				caller.Verified = Verify(secret, caller.SessionID, token)
-				if !caller.Verified && log != nil {
-					log.Warn("session token rejected for claimed session",
-						"session", caller.SessionID, "method", r.Method, "path", r.URL.Path)
+			if caller.SessionID != "" {
+				if token != "" {
+					caller.Verified = Verify(secret, caller.SessionID, token)
+					if !caller.Verified && log != nil {
+						log.Warn("session token rejected for claimed session",
+							"session", caller.SessionID, "method", r.Method, "path", r.URL.Path)
+					}
 				}
+				caller.Claimed = !caller.Verified
 			}
 			next.ServeHTTP(w, r.WithContext(WithCaller(r.Context(), caller)))
 		})

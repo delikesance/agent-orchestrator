@@ -809,6 +809,7 @@ func TestDeriveKanbanPresentationPipelineStageCeiling(t *testing.T) {
 	t.Parallel()
 	mergeable := []contract.KanbanPRFacts{{URL: "pr/1", Mergeability: contract.MergeMergeable}}
 	merged := []contract.KanbanPRFacts{{URL: "pr/1", Merged: true}}
+	closed := []contract.KanbanPRFacts{{URL: "pr/1", Closed: true}}
 	inReview := []contract.KanbanPRFacts{{URL: "pr/1"}}
 	tests := []struct {
 		name          string
@@ -831,6 +832,15 @@ func TestDeriveKanbanPresentationPipelineStageCeiling(t *testing.T) {
 		{name: "merged terminated archives", stage: "merged", terminated: true, prs: merged, want: contract.KanbanArchive},
 		{name: "escalated stays on its source lane", stage: "escalated", prs: inReview, want: contract.KanbanNeedsReview, wantEscalated: true},
 		{name: "escalated without pr stays building", stage: "escalated", want: contract.KanbanBuilding, wantEscalated: true},
+		{name: "building lets a merged pr through", stage: "building", prs: merged, want: contract.KanbanReady},
+		{name: "building lets a closed pr through", stage: "building", prs: closed, want: contract.KanbanReady},
+		{name: "validating lets a merged pr through", stage: "validating", prs: merged, want: contract.KanbanReady},
+		{name: "validating lets a closed pr through", stage: "validating", prs: closed, want: contract.KanbanReady},
+		{name: "review lets a merged pr through", stage: "review", prs: merged, want: contract.KanbanReady},
+		{name: "review lets a closed pr through", stage: "review", prs: closed, want: contract.KanbanReady},
+		{name: "building caps an open pr", stage: "building", prs: inReview, want: contract.KanbanBuilding},
+		{name: "review caps an open mergeable pr", stage: "review", prs: mergeable, want: contract.KanbanNeedsReview},
+		{name: "validating with no pr stays building", stage: "validating", want: contract.KanbanBuilding},
 		{name: "terminated archives under any stage", stage: "validating", terminated: true, prs: inReview, want: contract.KanbanArchive},
 	}
 	for _, tt := range tests {

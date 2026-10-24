@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -133,14 +134,14 @@ func TestMiddlewareVerifiedUnverifiedAndForged(t *testing.T) {
 	if code := do("", ""); code != http.StatusNoContent || got != (Caller{}) {
 		t.Errorf("no headers: code %d caller %+v", code, got)
 	}
-	if code := do("mer-1", ""); code != http.StatusNoContent || got != (Caller{SessionID: "mer-1"}) {
+	if code := do("mer-1", ""); code != http.StatusNoContent || got != (Caller{SessionID: "mer-1", Claimed: true}) {
 		t.Errorf("claim without token: code %d caller %+v", code, got)
 	}
 	if strings.Contains(logs.String(), "rejected") {
 		t.Errorf("a missing token must not warn: %s", logs.String())
 	}
 	forgedToken := Issue(secret, "mer-1")
-	if code := do("mer-2", forgedToken); code != http.StatusNoContent || got != (Caller{SessionID: "mer-2"}) {
+	if code := do("mer-2", forgedToken); code != http.StatusNoContent || got != (Caller{SessionID: "mer-2", Claimed: true}) {
 		t.Errorf("forged id: code %d caller %+v", code, got)
 	}
 	out := logs.String()
@@ -150,7 +151,7 @@ func TestMiddlewareVerifiedUnverifiedAndForged(t *testing.T) {
 	if strings.Contains(out, forgedToken) {
 		t.Errorf("log echoes the token: %s", out)
 	}
-	if code := do("mer-1", "garbage"); code != http.StatusNoContent || got.Verified {
+	if code := do("mer-1", "garbage"); code != http.StatusNoContent || got.Verified || !got.Claimed || !got.Untrusted() {
 		t.Errorf("garbage token: code %d caller %+v", code, got)
 	}
 }
@@ -158,5 +159,64 @@ func TestMiddlewareVerifiedUnverifiedAndForged(t *testing.T) {
 func TestCallerFromContextDefaultsToZero(t *testing.T) {
 	if got := CallerFromContext(httptest.NewRequest(http.MethodGet, "/", http.NoBody).Context()); got != (Caller{}) {
 		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestUntrustedIsClaimedWithoutProof(t *testing.T) {
+	for name, tc := range map[string]struct {
+		caller Caller
+		want   bool
+	}{
+		"human":    {Caller{}, false},
+		"verified": {Caller{SessionID: "a", Verified: true}, false},
+		"claimed":  {Caller{SessionID: "a", Claimed: true}, true},
+	} {
+		if got := tc.caller.Untrusted(); got != tc.want {
+			t.Errorf("%s: Untrusted() = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+func TestReviewTokenIsDomainSeparatedFromSessionTokens(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	token := IssueReview(secret, "rev-1")
+	if token == "" || !VerifyReview(secret, "rev-1", token) {
+		t.Fatal("a review token must verify for its own review")
+	}
+	if VerifyReview(secret, "rev-2", token) {
+		t.Error("a review token must not verify for another review")
+	}
+	if VerifyReview([]byte("another-secret-another-secret-00"), "rev-1", token) {
+		t.Error("a review token must not verify under another secret")
+	}
+	if token == Issue(secret, "rev-1") {
+		t.Error("a review token must never equal a session token for the same id")
+	}
+	if Verify(secret, "rev-1", token) {
+		t.Error("a review token must not authenticate a session")
+	}
+	if VerifyReview(secret, "rev-1", Issue(secret, "rev-1")) {
+		t.Error("a session token must not authenticate a review")
+	}
+	if IssueReview(nil, "rev-1") != "" || IssueReview(secret, "") != "" || VerifyReview(secret, "rev-1", "") {
+		t.Error("empty secret, id or token must never verify")
+	}
+}
+
+func TestDaemonSecretFallbackLogsErrorOnce(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+	a := DaemonSecret(blocker, log)
+	b := DaemonSecret(blocker, log)
+	if len(a) == 0 || !bytes.Equal(a, b) {
+		t.Fatal("the process-local fallback must still be one stable secret")
+	}
+	out := logs.String()
+	if strings.Count(out, "level=ERROR") != 1 || !strings.Contains(out, "will NOT survive a daemon restart") {
+		t.Fatalf("want exactly one clear Error log, got: %s", out)
 	}
 }

@@ -365,25 +365,32 @@ func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", attachErr.code, attachErr.message, nil)
 		return
 	}
+	// The parent id in the body is only a claim. A caller the daemon verified
+	// (X-AO-Session-Token) is the authority: a body naming another parent is a
+	// forged lineage, and a body naming none is filled in with the caller, so a
+	// raw HTTP spawn cannot launder a worker out of the mandatory pipeline (only
+	// a spawn with a parent is enrolled). An unverified caller keeps the legacy
+	// behaviour and the manager is told the claim is unproven.
+	caller := sessionauth.CallerFromContext(r.Context())
+	parentVerified := false
+	if caller.Verified && strings.TrimSpace(caller.SessionID) != "" {
+		switch {
+		case in.ParentSessionID != "" && string(in.ParentSessionID) != caller.SessionID:
+			envelope.WriteAPIError(w, r, http.StatusForbidden, "forbidden", "PARENT_SESSION_MISMATCH", "parentSessionId does not match the authenticated calling session", nil)
+			return
+		case in.ParentSessionID != "":
+			parentVerified = true
+		case in.Kind == domain.KindWorker:
+			in.ParentSessionID = domain.SessionID(caller.SessionID)
+			parentVerified = true
+		}
+	}
 	requestHash := ""
 	if in.ClientRequestID != "" {
 		keyless := in
 		keyless.ClientRequestID = ""
 		keyless.Attachments = nil
 		requestHash = clientRequestFingerprint("session", keyless, attachments)
-	}
-	// The parent id in the body is only a claim. A caller the daemon verified
-	// (X-AO-Session-Token) is the authority: a body naming another parent is a
-	// forged lineage. An unverified caller keeps the legacy behaviour and the
-	// manager is told the claim is unproven.
-	caller := sessionauth.CallerFromContext(r.Context())
-	parentVerified := false
-	if in.ParentSessionID != "" && caller.Verified {
-		if string(in.ParentSessionID) != caller.SessionID {
-			envelope.WriteAPIError(w, r, http.StatusForbidden, "forbidden", "PARENT_SESSION_MISMATCH", "parentSessionId does not match the authenticated calling session", nil)
-			return
-		}
-		parentVerified = true
 	}
 	sess, promptBytes, systemPromptBytes, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, ParentSessionID: in.ParentSessionID, ParentVerified: parentVerified, TrackerProvider: in.TrackerProvider, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, RequestedMode: in.Mode, Prompt: in.Prompt, RequestedOutput: in.RequestedOutput, Tier: in.Tier, DisplayName: displayName, Attachments: attachments, AgentConfig: ports.AgentConfig{Model: in.Model, Effort: in.Effort, Permissions: in.ApprovalMode}, EffortOverride: strings.TrimSpace(in.Effort) != "", ClientRequestID: in.ClientRequestID, ClientRequestHash: requestHash})
 	if err != nil {

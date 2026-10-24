@@ -106,6 +106,9 @@ type ValidationEvidence struct {
 	Commands []CommandEvidence `json:"commands"`
 	CI       *CIEvidence       `json:"ci,omitempty"`
 	Summary  string            `json:"summary"`
+	// Reason is set when the commands did not run because the worktree was not
+	// the tree the gate is bound to (reasonWorktreeNotAtHead, reasonWorktreeDirty).
+	Reason string `json:"reason,omitempty"`
 }
 
 // RunValidation runs the validation gate for a session in the validating stage
@@ -114,7 +117,10 @@ type ValidationEvidence struct {
 // meanwhile Advance returns ErrGateStale and nothing is recorded.
 //
 // It runs the project's validationCommands (timed script-step syntax) in the
-// session worktree, stopping at the first failure, then judges CI: with an open
+// session worktree, stopping at the first failure, then judges CI. Before any
+// command runs, the worktree must be at the head the gate is bound to with a
+// clean git status; otherwise nothing runs and a fail gate says what is wrong
+// (a failed attempt: the worker is told to commit and push): with an open
 // PR the CI state must be passing. With no commands and no usable CI it fails
 // closed: the session is escalated and ErrValidationNotConfigured returned,
 // unless pipeline.validation is "ci-only" with CI available. Pending CI returns
@@ -160,6 +166,16 @@ func (s *Service) RunValidation(ctx context.Context, id domain.SessionID) (Advan
 		if runner == nil {
 			runner = ShellRunner{}
 		}
+		if len(commands) > 0 {
+			reason, summary, err := s.checkWorktree(ctx, rec.Metadata.WorkspacePath, head)
+			if err != nil {
+				return AdvanceResult{}, err
+			}
+			if reason != "" {
+				ev.Reason, ev.Summary = reason, summary
+				return s.recordValidationFailure(ctx, id, head, ev)
+			}
+		}
 		for _, c := range commands {
 			ce := s.runCommand(ctx, runner, rec, c, secrets)
 			ev.Commands = append(ev.Commands, ce)
@@ -197,17 +213,26 @@ func (s *Service) RunValidation(ctx context.Context, id domain.SessionID) (Advan
 		ev.Summary = "validation passed"
 	}
 
+	if !passed {
+		return s.recordValidationFailure(ctx, id, head, ev)
+	}
 	raw, err := json.Marshal(ev)
 	if err != nil {
 		return AdvanceResult{}, err
 	}
-	gate := domain.PipelineGate{Stage: domain.PipelineStageValidating, HeadSHA: head, Evidence: string(raw)}
-	event := domain.PipelineEventValidationPassed
-	gate.Result = domain.GateResultPass
-	if !passed {
-		event, gate.Result = domain.PipelineEventValidationFailed, domain.GateResultFail
+	gate := domain.PipelineGate{Stage: domain.PipelineStageValidating, HeadSHA: head, Evidence: string(raw), Result: domain.GateResultPass}
+	return s.Advance(ctx, id, domain.PipelineEventValidationPassed, gate)
+}
+
+// recordValidationFailure feeds a failed validation_failed gate, bound to head,
+// to Advance.
+func (s *Service) recordValidationFailure(ctx context.Context, id domain.SessionID, head string, ev ValidationEvidence) (AdvanceResult, error) {
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		return AdvanceResult{}, err
 	}
-	return s.Advance(ctx, id, event, gate)
+	gate := domain.PipelineGate{Stage: domain.PipelineStageValidating, HeadSHA: head, Evidence: string(raw), Result: domain.GateResultFail}
+	return s.Advance(ctx, id, domain.PipelineEventValidationFailed, gate)
 }
 
 // ciState returns the open PR's facts; usable is true only when an open PR has a
@@ -266,7 +291,7 @@ func (s *Service) runCommand(ctx context.Context, runner CommandRunner, rec doma
 	// recognised, then keep the last 4 KiB.
 	ce.OutputTail = lastBytes(redact(out.String(), secrets), outputTailBytes)
 	if err != nil && ce.OutputTail == "" && !ce.TimedOut {
-		ce.OutputTail = redact(err.Error(), secrets)
+		ce.OutputTail = redactReason(err.Error(), secrets)
 	}
 	return ce
 }

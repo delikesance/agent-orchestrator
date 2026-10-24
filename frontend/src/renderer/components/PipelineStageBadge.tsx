@@ -13,7 +13,7 @@ export function PipelineStageBadge({ pipeline }: { pipeline: SessionPipeline | u
 	const { t } = useTranslation();
 	const model = pipelineBadgeModel(pipeline);
 	if (!model) return null;
-	const stage = t(`shell.pipelineStage.${model.stage}`);
+	const stage = t(`shell.pipelineStage.${model.stage}`, { defaultValue: model.stage });
 	const label = model.escalated
 		? t("shell.pipelineEscalatedAria", { attempt: model.attempt, max: model.maxAttempts })
 		: model.attemptLabel

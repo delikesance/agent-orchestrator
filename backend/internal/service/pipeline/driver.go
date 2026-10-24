@@ -229,7 +229,11 @@ func (d *Driver) noteFailure(ctx context.Context, id domain.SessionID, stage, re
 		return false
 	}
 	d.clearFailures(id, stage)
-	if _, err := d.d.Service.escalate(ctx, id, fmt.Sprintf("%s failed %d times: %s", stage, n, reason)); err != nil {
+	var secrets map[string]string
+	if rec, _, err := d.d.Service.load(ctx, id); err == nil {
+		secrets = d.d.Service.secrets(ctx, rec)
+	}
+	if _, err := d.d.Service.escalate(ctx, id, fmt.Sprintf("%s failed %d times: %s", stage, n, redactReason(reason, secrets))); err != nil {
 		d.d.Logger.Warn("pipeline: escalate failed", "session", id, "err", err)
 		return false
 	}
@@ -267,6 +271,23 @@ func (d *Driver) handleReport(ctx context.Context, id domain.SessionID, done boo
 	}
 	switch rec.PipelineStage {
 	case domain.PipelineStageBuilding:
+		if reason := d.d.Service.noDeliverable(ctx, rec); reason != "" {
+			// Nothing to validate: un-enrol (legacy kanban: no PR stays in the
+			// Building lane, an artifact shows in Validating) and tell the
+			// orchestrator once. A repeat report finds the stage empty and stops
+			// at active().
+			moved, err := d.d.Service.unenrollBuilding(ctx, id)
+			if err != nil {
+				d.d.Logger.Warn("pipeline: un-enrol failed", "session", id, "err", err)
+				return
+			}
+			if moved {
+				if err := d.d.Notices.NoDeliverable(ctx, rec, reason); err != nil {
+					d.d.Logger.Warn("pipeline: no-deliverable notice not delivered", "session", id, "err", err)
+				}
+			}
+			return
+		}
 		if headErr != nil || head == "" {
 			d.d.Logger.Warn("pipeline: cannot request validation, head unknown", "session", id, "err", headErr)
 			return
@@ -357,6 +378,12 @@ func (d *Driver) validate(ctx context.Context, id domain.SessionID) {
 			return
 		default:
 			d.d.Logger.Warn("pipeline: validation run failed", "session", id, "err", err)
+			// An infrastructure error (unknown head, git or store failure), not a
+			// failed gate: forget that validation started so the sweep and the next
+			// PR event retry it. noteFailure escalates after maxStepFailures.
+			d.mu.Lock()
+			delete(d.validationStarted, id)
+			d.mu.Unlock()
 			d.noteFailure(ctx, id, "validation", err.Error())
 			return
 		}
@@ -494,27 +521,36 @@ func (d *Driver) handlePR(ctx context.Context, id domain.SessionID, o ports.PROb
 }
 
 // onMerged records an observed merge. A READY session moves to merged with a
-// gate bound to the head; a merge at any other stage was a bypass (a human
-// merged on GitHub) and is only logged: nothing is blocked here.
+// gate bound to the head. A merge at any other enforced stage (a human merged
+// on GitHub while the task was building, validating, in review or escalated) is
+// a bypass: it is logged at Warn and the session still moves to merged, so it
+// is not stranded. An unknown head never keeps a session from leaving ready.
 func (d *Driver) onMerged(ctx context.Context, rec domain.SessionRecord) {
 	id := rec.ID
-	switch rec.PipelineStage {
-	case domain.PipelineStageMerged:
+	if rec.PipelineStage == domain.PipelineStageMerged {
 		return
-	case domain.PipelineStageReady:
+	}
+	if rec.PipelineStage == domain.PipelineStageReady {
 		head, err := d.d.Service.d.Heads.CurrentHead(ctx, rec)
-		if err != nil || head == "" {
-			d.d.Logger.Warn("pipeline: merge observed but head unknown", "session", id, "err", err)
-			return
+		if err == nil && head != "" {
+			_, err = d.d.Service.Advance(ctx, id, domain.PipelineEventMerged, domain.PipelineGate{HeadSHA: head})
+			if err == nil {
+				d.forgetSession(id)
+				d.d.Logger.Info("pipeline: merged", "session", id, "head", shortSHA(head))
+				return
+			}
 		}
-		if _, err := d.d.Service.Advance(ctx, id, domain.PipelineEventMerged, domain.PipelineGate{HeadSHA: head}); err != nil {
-			d.d.Logger.Warn("pipeline: merge observed but not recorded", "session", id, "head", shortSHA(head), "err", err)
-			return
-		}
+		// The gates no longer match a head (it moved, or could not be read):
+		// the merge happened anyway, so record it without the gate checks.
+		d.d.Logger.Warn("pipeline: merge observed in READY without matching gates, recording as external", "session", id, "head", shortSHA(head), "err", err)
+	}
+	moved, err := d.d.Service.markMergedExternally(ctx, id)
+	if err != nil {
+		d.d.Logger.Warn("pipeline: merge observed but not recorded", "session", id, "stage", rec.PipelineStage, "err", err)
+		return
+	}
+	if moved {
 		d.forgetSession(id)
-		d.d.Logger.Info("pipeline: merged", "session", id, "head", shortSHA(head))
-	default:
-		d.d.Logger.Warn("pipeline: merge observed outside READY (bypass)", "session", id, "stage", rec.PipelineStage, "attempt", rec.PipelineAttempt)
 	}
 }
 
@@ -631,6 +667,9 @@ func validationFailureMessage(res AdvanceResult) string {
 	}
 	if ev.Summary != "" {
 		b.WriteString("\n" + ev.Summary + "\n")
+	}
+	if ev.Reason != "" {
+		b.WriteString("\nValidation only runs on a committed and pushed tree: commit every change (including new files), push, then run `ao report --done` again.\n")
 	}
 	for _, c := range ev.Commands {
 		if c.ExitCode == 0 && !c.TimedOut {

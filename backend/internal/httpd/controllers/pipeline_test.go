@@ -211,7 +211,9 @@ func TestPipelineAPI_RetryAuthorizationMatrix(t *testing.T) {
 		advances int
 	}{
 		{callerHuman, http.StatusOK, "", 1},
-		{callerClaimedOrch, http.StatusOK, "", 1},
+		// A session id without its token is an agent that failed to authenticate,
+		// not a person: refused. The unclaimed human above still passes.
+		{callerClaimedOrch, http.StatusForbidden, "PIPELINE_FORBIDDEN", 0},
 		{callerOrchestrator, http.StatusOK, "", 1},
 		{callerWorker, http.StatusForbidden, "PIPELINE_FORBIDDEN", 0},
 		{callerOtherOrch, http.StatusForbidden, "PIPELINE_FORBIDDEN", 0},
@@ -263,7 +265,7 @@ func TestPipelineAPI_OverrideIsHumanOnly(t *testing.T) {
 		wantErr  string
 	}{
 		{callerHuman, http.StatusOK, ""},
-		{callerClaimedOrch, http.StatusOK, ""},
+		{callerClaimedOrch, http.StatusForbidden, "PIPELINE_FORBIDDEN"},
 		{callerOrchestrator, http.StatusForbidden, "PIPELINE_FORBIDDEN"},
 		{callerWorker, http.StatusForbidden, "PIPELINE_FORBIDDEN"},
 		{callerOtherOrch, http.StatusForbidden, "PIPELINE_FORBIDDEN"},

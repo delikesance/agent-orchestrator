@@ -32,3 +32,25 @@ func TestSeedRecordPipelineStage(t *testing.T) {
 		})
 	}
 }
+
+// A raw HTTP spawn from a verified orchestrator reaches the manager with the
+// parent the controller forced onto it; the worker must come out enrolled, and
+// a spawn that names no parent stays the legacy stage.
+func TestSpawnWithForcedVerifiedParentIsEnrolledInThePipeline(t *testing.T) {
+	m, st, _, _ := newManager()
+	nestedParent(st, "mer-orch", domain.KindOrchestrator, 0, "")
+	child, err := nestedSpawn(t, m, "mer-orch", "")
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if got := st.sessions[child.ID]; got.PipelineStage != domain.PipelineStageBuilding || got.ParentSessionID != "mer-orch" {
+		t.Fatalf("enrolled spawn = stage %q parent %q, want building under mer-orch", got.PipelineStage, got.ParentSessionID)
+	}
+	loose, err := nestedSpawn(t, m, "", "")
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if got := st.sessions[loose.ID]; got.PipelineStage != domain.PipelineStageNone {
+		t.Fatalf("parentless spawn stage = %q, want legacy", got.PipelineStage)
+	}
+}

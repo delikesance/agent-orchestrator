@@ -7,13 +7,13 @@ import (
 	"testing"
 )
 
-func TestDaemonRequestsCarrySessionTokenOnlyWhenBothEnvVarsExist(t *testing.T) {
+func TestDaemonRequestsAlwaysNameTheSessionAndCarryTheTokenWhenPresent(t *testing.T) {
 	cases := []struct {
 		name, id, token string
 		wantID, wantTok string
 	}{
 		{name: "both", id: "mer-1", token: "tok", wantID: "mer-1", wantTok: "tok"},
-		{name: "id only", id: "mer-1"},
+		{name: "id only is still claimed", id: "mer-1", wantID: "mer-1"},
 		{name: "token only", token: "tok"},
 		{name: "neither"},
 	}

@@ -6456,6 +6456,9 @@ func (m *Manager) runtimeEnvChecked(id domain.SessionID, project domain.ProjectI
 	if token := sessionauth.Issue(m.sessionSecret, string(id)); token != "" {
 		env[EnvSessionToken] = token
 	}
+	// The review token is the reviewer's proof alone: a worker holding it could
+	// submit its own verdict. Neither the project nor the spawn may supply one.
+	deleteProtectedEnv(env, sessionauth.EnvReviewToken, caseInsensitive)
 	setProtectedEnv(env, EnvBrowserCapability, "", caseInsensitive)
 	setProtectedEnv(env, EnvBrowserRuntimeToken, "", caseInsensitive)
 	setProtectedEnv(env, EnvBrowserRuntimeTokenStdin, "", caseInsensitive)

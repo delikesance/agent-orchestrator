@@ -55,7 +55,7 @@ func newSideWorkflow(t *testing.T, mode string, harnesses ...domain.AgentHarness
 	changed := &changedExcerptStore{Store: st, mode: mode}
 	var ids atomic.Int64
 	svc := chatsvc.New(chatsvc.Options{Store: changed, Reader: fullSnapshotReader(st), Sessions: st, Drivers: fakeRegistry{driver: driver}, AppRunID: "workflow", NewID: func() string { return fmt.Sprintf("workflow-%d", ids.Add(1)) }})
-	ctrl, err := svc.Start(ctx, chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: harnessType, WorkspacePath: t.TempDir(), Model: "initial", Effort: "low", Permissions: "default", SystemPrompt: "Frozen instructions", MCPServers: []ports.ChatMCPServerConfig{{Name: "exploration", Type: "stdio", Command: "test-mcp", Env: map[string]string{"AO_SESSION_ID": string(testSession)}}}})
+	ctrl, err := svc.Start(ctx, chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: harnessType, WorkspacePath: t.TempDir(), Model: "initial", Effort: "low", Permissions: "default", SystemPrompt: "Frozen instructions", MCPServers: []ports.ChatMCPServerConfig{{Name: "exploration", Type: "stdio", Command: "test-mcp", Env: map[string]string{"AO_SESSION_ID": string(testSession), "AO_SESSION_TOKEN": "tool-server-secret", "AO_REVIEW_TOKEN": "tool-server-review-secret"}}}, Env: map[string]string{"AO_SESSION_TOKEN": "main-secret", "AO_REVIEW_TOKEN": "main-review-secret"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -519,11 +519,24 @@ func TestSideCreationFromOlderExcerptUsesLatestCompletedAnchor(t *testing.T) {
 	if env := cfg.MCPServers[0].Env; env["AO_SESSION_ID"] != cfg.Env["AO_SESSION_ID"] || env["AO_SIDE_CONVERSATION_ID"] != side.ID {
 		t.Fatalf("side tool server env = %v, side env session = %q", env, cfg.Env["AO_SESSION_ID"])
 	}
+	// No credential of the main session survives anywhere in the side's config,
+	// including the tool server env and the persisted frozen launch config.
+	for _, secret := range []string{"main-secret", "main-review-secret", "tool-server-secret", "tool-server-review-secret"} {
+		if blob, _ := json.Marshal(cfg); strings.Contains(string(blob), secret) {
+			t.Fatalf("side launch config carries %q: %s", secret, blob)
+		}
+		if strings.Contains(string(side.LaunchConfig), secret) {
+			t.Fatalf("persisted side config carries %q: %s", secret, side.LaunchConfig)
+		}
+	}
+	if len(side.LaunchConfig) == 0 {
+		t.Fatal("side has no frozen launch config to check")
+	}
 	// Rewriting the side's copy must not touch the main session's servers.
 	h.driver.mu.Lock()
 	mainServers := h.driver.mainConfig.MCPServers
 	h.driver.mu.Unlock()
-	if mainServers[0].Env["AO_SESSION_ID"] != string(testSession) {
+	if mainServers[0].Env["AO_SESSION_ID"] != string(testSession) || mainServers[0].Env["AO_SESSION_TOKEN"] != "tool-server-secret" {
 		t.Fatalf("main tool server env changed: %v", mainServers[0].Env)
 	}
 }

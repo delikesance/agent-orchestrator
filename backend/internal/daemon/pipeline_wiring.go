@@ -92,6 +92,13 @@ func wirePipelineDriver(ctx context.Context, svc *pipeline.Service, store *sqlit
 	}); ok {
 		settable.SetPipelineHook(driver)
 	}
+	// Token enforcement on review submit needs each session's enforcement mode,
+	// which only the pipeline service knows.
+	if settable, ok := reviews.(interface {
+		SetPipelineModes(reviewsvc.PipelineModes)
+	}); ok {
+		settable.SetPipelineModes(svc)
+	}
 	return driver, nil
 }
 

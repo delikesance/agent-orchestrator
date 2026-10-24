@@ -14,6 +14,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 )
 
 type fakeReviewer struct {
@@ -122,6 +123,44 @@ func TestLauncherSpawnEnvCannotOverrideWorkerContext(t *testing.T) {
 	}
 	if rt.createCfg.Env[EnvRunFile] != runFile {
 		t.Fatalf("%s = %q, want %q", EnvRunFile, rt.createCfg.Env[EnvRunFile], runFile)
+	}
+}
+
+func TestLauncherSpawnInjectsReviewTokenForTheReviewRowOnly(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	reviewer := &fakeReviewer{env: map[string]string{
+		sessionauth.EnvReviewToken:     "adapter-supplied",
+		sessionmanager.EnvSessionToken: "worker-session-token",
+	}}
+	rt := &fakeRuntime{}
+	l := NewLauncher(fakeReviewerResolver{reviewer: reviewer, ok: true}, rt, t.TempDir(), WithSessionSecret(secret))
+
+	spec := launchSpec()
+	spec.ProjectEnv = map[string]string{sessionauth.EnvReviewToken: "project-supplied"}
+	if _, err := l.Spawn(context.Background(), spec); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	got := rt.createCfg.Env[sessionauth.EnvReviewToken]
+	if got == "" || !sessionauth.VerifyReview(secret, spec.ReviewSessionID, got) {
+		t.Fatalf("reviewer env %s = %q, want the token for review %q", sessionauth.EnvReviewToken, got, spec.ReviewSessionID)
+	}
+	if sessionauth.VerifyReview(secret, "another-review", got) {
+		t.Fatal("the reviewer token must be bound to its own review row")
+	}
+	if v, ok := rt.createCfg.Env[sessionmanager.EnvSessionToken]; ok {
+		t.Fatalf("reviewer env must not carry a session token, got %q", v)
+	}
+}
+
+func TestLauncherSpawnWithoutSecretExportsNoReviewToken(t *testing.T) {
+	reviewer := &fakeReviewer{env: map[string]string{sessionauth.EnvReviewToken: "adapter-supplied"}}
+	rt := &fakeRuntime{}
+	l := NewLauncher(fakeReviewerResolver{reviewer: reviewer, ok: true}, rt, t.TempDir())
+	if _, err := l.Spawn(context.Background(), launchSpec()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if v, ok := rt.createCfg.Env[sessionauth.EnvReviewToken]; ok {
+		t.Fatalf("no secret must export no token, got %q", v)
 	}
 }
 

@@ -736,3 +736,26 @@ func TestReviewListDefaultsToCallingSession(t *testing.T) {
 		t.Fatalf("path = %q, want the calling session", capture.path)
 	}
 }
+
+func TestReviewSubmitSendsTheReviewTokenOnlyWhenPresent(t *testing.T) {
+	for name, token := range map[string]string{"reviewer pane": "rev-token", "no token": ""} {
+		t.Run(name, func(t *testing.T) {
+			cfg := setReviewEnv(t)
+			t.Setenv("AO_REVIEW_TOKEN", token)
+			var got string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = r.Header.Get("X-AO-Review-Token")
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"review":{"id":"run-1","verdict":"approved"}}`)
+			}))
+			t.Cleanup(srv.Close)
+			writeRunFileFor(t, cfg, srv)
+			if _, errOut, err := executeCLI(t, aliveDeps(), "review", "submit", "mer-1", "--run", "run-1", "--verdict", "approved"); err != nil {
+				t.Fatalf("unexpected error: %v\nstderr=%s", err, errOut)
+			}
+			if got != token {
+				t.Fatalf("X-AO-Review-Token = %q, want %q", got, token)
+			}
+		})
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/agentlaunch"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
 )
 
@@ -164,6 +165,9 @@ type agentLauncher struct {
 	auth       agentAuthResolver
 	executable func() (string, error)
 	chat       ReviewerChatController
+	// sessionSecret keys the AO_REVIEW_TOKEN a reviewer pane carries. Empty
+	// exports no token.
+	sessionSecret []byte
 }
 
 type preLaunchReviewer interface {
@@ -203,6 +207,13 @@ func WithExecutable(executable func() (string, error)) LauncherOption {
 	return func(l *agentLauncher) {
 		l.executable = executable
 	}
+}
+
+// WithSessionSecret keys the AO_REVIEW_TOKEN injected into reviewer panes and
+// chats: the proof the daemon requires on `ao review submit` for a pipeline
+// session. It is only ever exported to the reviewer, never to the worker.
+func WithSessionSecret(secret []byte) LauncherOption {
+	return func(l *agentLauncher) { l.sessionSecret = secret }
 }
 
 // WithRunFilePath pins reviewer-local AO CLI calls to this daemon's run-file.
@@ -671,6 +682,14 @@ func outputContainsAny(output string, patterns []string) bool {
 func (l *agentLauncher) runtimeEnv(ctx context.Context, spec LaunchSpec, argv []string, base map[string]string) map[string]string {
 	env := agentlaunch.MergeEnv(spec.ProjectEnv, base)
 	delete(env, sessionmanager.EnvSessionID)
+	// A reviewer is not the worker: it must not inherit a session token, and a
+	// project cannot hand it a review token. The review token is last-wins and
+	// keyed on the review row, so it covers every run of that worker's review.
+	delete(env, sessionmanager.EnvSessionToken)
+	delete(env, sessionauth.EnvReviewToken)
+	if token := sessionauth.IssueReview(l.sessionSecret, spec.ReviewSessionID); token != "" {
+		env[sessionauth.EnvReviewToken] = token
+	}
 	env["AO_REVIEW_SESSION_ID"] = spec.ReviewSessionID
 	env["AO_REVIEW_WORKER_SESSION_ID"] = string(spec.WorkerID)
 	env["AO_REVIEW_HARNESS"] = string(spec.Harness)

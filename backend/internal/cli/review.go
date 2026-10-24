@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 )
 
 const (
@@ -298,6 +301,16 @@ func (c *commandContext) submitReviewBatch(cmd *cobra.Command, session string, o
 	return err
 }
 
+// reviewTokenHeaders carries the reviewer's AO_REVIEW_TOKEN, present only in a
+// reviewer pane. The daemon requires it to accept a verdict on a pipeline
+// session, so a worker cannot submit one for its own review run.
+func reviewTokenHeaders() map[string]string {
+	if token := strings.TrimSpace(os.Getenv(sessionauth.EnvReviewToken)); token != "" {
+		return map[string]string{sessionauth.HeaderReviewToken: token}
+	}
+	return nil
+}
+
 // postReviewJSON retries only transport-level daemon unavailability. The
 // service accepts an identical completed result idempotently, so replay is safe
 // even when a connection drops after the daemon committed the first request.
@@ -308,7 +321,7 @@ func (c *commandContext) postReviewJSON(ctx context.Context, path string, body s
 
 	var lastErr error
 	for {
-		err := c.postJSON(retryCtx, path, body, out)
+		err := c.doJSONPathWithHeaders(retryCtx, http.MethodPost, "/api/v1/"+path, body, out, reviewTokenHeaders())
 		if err == nil {
 			return nil
 		}

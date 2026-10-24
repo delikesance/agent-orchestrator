@@ -35,6 +35,13 @@ type fakeWorld struct {
 	clk      *stepClock
 	prs      []domain.PullRequest
 	reviews  []domain.ReviewRun
+	// gitHead is the worktree HEAD the fake GitState reports; empty follows head.
+	gitHead  string
+	gitDirty int
+	gitErr   error
+	// gitAhead is the AheadCount the fake reports once gitAheadSet is true.
+	gitAhead    int
+	gitAheadSet bool
 }
 
 // stepClock is a settable clock for the sweep and notice tests.
@@ -245,6 +252,40 @@ func (w *fakeWorld) Run(_ context.Context, _, command string, _ map[string]strin
 	return fn(command, out)
 }
 
+// Head and DirtyFiles make the world a GitState: a clean worktree at the head
+// unless a test sets gitHead, gitDirty or gitErr.
+func (w *fakeWorld) Head(context.Context, string) (string, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.gitErr != nil {
+		return "", w.gitErr
+	}
+	if w.gitHead != "" {
+		return w.gitHead, nil
+	}
+	return w.head, nil
+}
+
+func (w *fakeWorld) DirtyFiles(context.Context, string) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.gitDirty, w.gitErr
+}
+
+// AheadCount reports gitAhead (default 1: the worker committed something) so
+// existing tests keep the normal validation path.
+func (w *fakeWorld) AheadCount(context.Context, string, []string, string) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.gitErr != nil {
+		return 0, w.gitErr
+	}
+	if w.gitAheadSet {
+		return w.gitAhead, nil
+	}
+	return 1, nil
+}
+
 func (w *fakeWorld) Notify(_ context.Context, n Notice) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -270,7 +311,7 @@ func (w *fakeWorld) service(t *testing.T) *Service {
 	t.Helper()
 	s, err := New(Deps{
 		Sessions: w, Gates: w, Projects: w, PRFacts: w, Heads: w,
-		Runner: w, Notifier: w, Clock: w, NewID: w.newID,
+		Runner: w, Git: w, Notifier: w, Clock: w, NewID: w.newID,
 	})
 	if err != nil {
 		t.Fatal(err)

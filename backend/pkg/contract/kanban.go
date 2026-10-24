@@ -308,6 +308,11 @@ func DeriveKanbanPresentation(
 		presentation.Escalated = true
 		return presentation
 	}
+	// A PR merged or closed on GitHub is a terminal fact the pipeline cannot
+	// hold back: the legacy lane wins so the card is not stranded below ready.
+	if chosen.Merged || chosen.Closed {
+		return presentation
+	}
 	ceiling, capped := pipelineCeiling(session.PipelineStage)
 	if capped && kanbanLaneRank(presentation.Column) > kanbanLaneRank(ceiling) {
 		presentation.Column = ceiling

@@ -95,6 +95,8 @@ type Service struct {
 	notifications      reviewNotificationSink
 	prRefresher        PRRefresher
 	pipelineHook       PipelineHook
+	pipelineModes      PipelineModes
+	sessionSecret      []byte
 	// engineTrigger indirects the engine's source-tagged trigger so the
 	// instrumented path can be exercised without standing up a full engine and
 	// its eighteen-method store. Defaulted in New; only tests replace it.
@@ -849,6 +851,12 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 	if run.SessionID != workerID {
 		return domain.ReviewRun{}, fmt.Errorf("%w: review run %q does not belong to worker %q", ErrInvalid, runID, workerID)
 	}
+	reviewerUnverified, err := s.authorizeSubmit(ctx, run)
+	if err != nil {
+		return domain.ReviewRun{}, err
+	}
+	// Carried to the pipeline hook only (json:"-"); never persisted.
+	run.ReviewerUnverified = reviewerUnverified
 
 	switch run.Status {
 	case domain.ReviewRunRunning:

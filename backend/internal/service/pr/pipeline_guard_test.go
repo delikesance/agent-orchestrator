@@ -51,7 +51,7 @@ func TestActionServiceMerge_PipelineEnforcementMatrix(t *testing.T) {
 		"verified worker":          {SessionID: "worker-2", Verified: true},
 		"verified orchestrator":    {SessionID: "orch-a", Verified: true},
 		"verified other-project":   {SessionID: "orch-b", Verified: true},
-		"unverified claims orch":   {SessionID: "orch-a"},
+		"unverified claims orch":   {SessionID: "orch-a", Claimed: true},
 		"unverified human":         {},
 		"verified unknown session": {SessionID: "ghost", Verified: true},
 	}
@@ -64,7 +64,10 @@ func TestActionServiceMerge_PipelineEnforcementMatrix(t *testing.T) {
 		switch {
 		case mode == domain.PipelineEnforceOff, stage == domain.PipelineStageNone:
 			return allow
-		case caller == "unverified claims orch", caller == "unverified human":
+		case caller == "unverified claims orch":
+			// Named a session without proof: an agent, never a human.
+			return forbidden
+		case caller == "unverified human":
 			return allow
 		case caller == "verified orchestrator":
 			if stage != domain.PipelineStageReady && mode == domain.PipelineEnforceOn {
@@ -219,5 +222,93 @@ func TestActionServiceMerge_PipelineSkipsUnownedAndMissingOwner(t *testing.T) {
 	})
 	if _, err := svc.Merge(context.Background(), MergeRequest{PRID: "42", PRURL: pr.URL, ExpectedHeadSHA: pr.HeadSHA, Caller: worker}); err != nil {
 		t.Fatalf("missing owner: %v", err)
+	}
+}
+
+func TestActionServiceMerge_ClaimedButUnverifiedCallerIsRefusedAndHumanPasses(t *testing.T) {
+	for _, mode := range []domain.PipelineEnforce{domain.PipelineEnforceWarn, domain.PipelineEnforceOn} {
+		for name, tc := range map[string]struct {
+			caller    sessionauth.Caller
+			forbidden bool
+		}{
+			"claimed orchestrator, no token": {sessionauth.Caller{SessionID: "orch-a", Claimed: true}, true},
+			"claimed worker, wrong token":    {sessionauth.Caller{SessionID: "worker-2", Claimed: true}, true},
+			"unclaimed human":                {sessionauth.Caller{}, false},
+		} {
+			t.Run(string(mode)+"/"+name, func(t *testing.T) {
+				pr, scm := mergeableActionFixture()
+				pr.SessionID = guardOwner
+				svc := NewActionService(ActionDeps{
+					Store:  &fakeActionStore{pr: pr, ok: true},
+					Reader: scm, Merger: scm,
+					Pipeline: fakePipelineGuard{status: pipeline.Status{
+						Stage: domain.PipelineStageReady, Mode: mode,
+						Gates: []domain.PipelineGate{{Stage: domain.PipelineStageReview, HeadSHA: pr.HeadSHA}},
+					}},
+					Sessions: guardSessions(),
+				})
+				_, err := svc.Merge(context.Background(), MergeRequest{PRID: "42", PRURL: pr.URL, ExpectedHeadSHA: pr.HeadSHA, Caller: tc.caller})
+				if tc.forbidden {
+					if !errors.Is(err, ErrPipelineMergeForbidden) || scm.mergeCalls != 0 {
+						t.Fatalf("err = %v, merges = %d, want ErrPipelineMergeForbidden", err, scm.mergeCalls)
+					}
+					return
+				}
+				if err != nil || scm.mergeCalls != 1 {
+					t.Fatalf("err = %v, merges = %d, want allowed", err, scm.mergeCalls)
+				}
+			})
+		}
+	}
+}
+
+func TestActionServiceMerge_SecondPRAfterMergedIsFlagged(t *testing.T) {
+	orch := sessionauth.Caller{SessionID: "orch-a", Verified: true}
+	firstHead := strings.Repeat("b", 40)
+	for _, tc := range []struct {
+		name    string
+		mode    domain.PipelineEnforce
+		merged  bool // the PR being merged is the one the pipeline recorded as merged
+		gateSHA string
+		wantErr bool // ErrPipelineNotReady
+		warn    bool
+	}{
+		{name: "second PR, on", mode: domain.PipelineEnforceOn, gateSHA: firstHead, wantErr: true},
+		{name: "second PR, warn", mode: domain.PipelineEnforceWarn, gateSHA: firstHead, warn: true},
+		{name: "no gate recorded, on", mode: domain.PipelineEnforceOn, wantErr: true},
+		{name: "the recorded merged PR", mode: domain.PipelineEnforceOn, merged: true, gateSHA: firstHead},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pr, scm := mergeableActionFixture()
+			pr.SessionID = guardOwner
+			pr.Merged = tc.merged
+			var gates []domain.PipelineGate
+			if tc.gateSHA != "" {
+				gates = []domain.PipelineGate{{Stage: domain.PipelineStageReview, HeadSHA: tc.gateSHA}}
+			}
+			svc := NewActionService(ActionDeps{
+				Store:  &fakeActionStore{pr: pr, ok: true},
+				Reader: scm, Merger: scm,
+				Pipeline: fakePipelineGuard{status: pipeline.Status{Stage: domain.PipelineStageMerged, Mode: tc.mode, Gates: gates}},
+				Sessions: guardSessions(),
+			})
+			res, err := svc.Merge(context.Background(), MergeRequest{PRID: "42", PRURL: pr.URL, ExpectedHeadSHA: pr.HeadSHA, Caller: orch})
+			switch {
+			case tc.wantErr:
+				if !errors.Is(err, ErrPipelineNotReady) || scm.mergeCalls != 0 {
+					t.Fatalf("err = %v, merges = %d, want ErrPipelineNotReady", err, scm.mergeCalls)
+				}
+			case tc.warn:
+				if err != nil || scm.mergeCalls != 1 || res.PipelineWarning == "" {
+					t.Fatalf("err = %v, merges = %d, warning %q, want allowed with a warning", err, scm.mergeCalls, res.PipelineWarning)
+				}
+			default:
+				// The already-merged recorded PR is not a pipeline violation; the
+				// merge itself still refuses it as not mergeable.
+				if errors.Is(err, ErrPipelineNotReady) || errors.Is(err, ErrPipelineMergeForbidden) {
+					t.Fatalf("err = %v, want no pipeline violation", err)
+				}
+			}
+		})
 	}
 }

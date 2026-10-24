@@ -97,6 +97,11 @@ type ReviewRun struct {
 	// AutoInjectReview snapshots the session policy when this result is first
 	// recorded. Later toggle changes must not rewrite or deliver this run.
 	AutoInjectReview bool `json:"autoInjectReview"`
+	// ReviewerUnverified is set on the in-memory run handed to the pipeline
+	// hook when a pipeline session's verdict was accepted in warn mode without
+	// the reviewer's review token. It is never persisted or serialised; the
+	// pipeline gate evidence records it as reviewerVerified=false.
+	ReviewerUnverified bool `json:"-"`
 }
 
 // ReviewTriggerSource identifies who initiated a review pass.

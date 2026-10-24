@@ -289,10 +289,10 @@ func TestDriverRecordsAnObservedMerge(t *testing.T) {
 		env.drv.OnPRObservation(testSession, ports.PRObservation{Fetched: true, Merged: true}) // idempotent
 		env.wantStage(t, domain.PipelineStageMerged)
 	})
-	t.Run("bypass outside ready only logs", func(t *testing.T) {
+	t.Run("bypass outside ready still moves to merged without a gate", func(t *testing.T) {
 		env := newDriverEnv(t, domain.PipelineStageBuilding, nil)
 		env.drv.OnPRObservation(testSession, ports.PRObservation{Fetched: true, Merged: true})
-		env.wantStage(t, domain.PipelineStageBuilding)
+		env.wantStage(t, domain.PipelineStageMerged)
 		if env.w.gateCount() != 0 {
 			t.Fatal("a gate was recorded for a bypass")
 		}

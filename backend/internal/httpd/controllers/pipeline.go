@@ -141,6 +141,10 @@ func (c *PipelineController) retry(w http.ResponseWriter, r *http.Request) {
 	}
 	id := sessionID(r)
 	caller := sessionauth.CallerFromContext(r.Context())
+	if caller.Untrusted() {
+		writePipelineForbidden(w, r, untrustedCallerMessage)
+		return
+	}
 	if caller.Verified && strings.TrimSpace(caller.SessionID) != "" {
 		ok, err := c.isProjectOrchestrator(r.Context(), caller.SessionID, id)
 		if err != nil {
@@ -172,7 +176,7 @@ func (c *PipelineController) override(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	caller := sessionauth.CallerFromContext(r.Context())
-	if caller.Verified {
+	if caller.Verified || caller.Untrusted() {
 		writePipelineForbidden(w, r, "Only a person may override the pipeline")
 		return
 	}
@@ -225,6 +229,11 @@ func pipelineActionResponse(res pipeline.AdvanceResult) PipelineActionResponse {
 		MaxAttempts: res.MaxAttempts,
 	}
 }
+
+// untrustedCallerMessage answers a request that named a session (X-AO-Session)
+// without proving it. A person in the desktop UI never names one, so such a
+// caller is an agent whose token is missing or wrong.
+const untrustedCallerMessage = "The request names a session without a valid session token; restart the session so it receives one"
 
 func writePipelineForbidden(w http.ResponseWriter, r *http.Request, msg string) {
 	envelope.WriteAPIError(w, r, http.StatusForbidden, "forbidden", "PIPELINE_FORBIDDEN", msg, nil)

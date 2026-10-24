@@ -35,8 +35,10 @@ func (s *ActionService) SetPipelineGuard(guard PipelineGuard, sessions SessionLo
 //   - no guard, an unowned PR, a missing owner or a legacy (empty stage) owner:
 //     allowed, unchanged behaviour;
 //   - mode off: allowed;
-//   - unverified caller (human UI, external tool): allowed; a not-ready merge
-//     under mode on is recorded as a bypass in the log;
+//   - a caller that named a session without proving it (X-AO-Session without a
+//     valid token) is an unauthenticated agent, not a person: ErrPipelineMergeForbidden;
+//   - unverified, unclaimed caller (human UI, external tool): allowed; a
+//     not-ready merge under mode on is recorded as a bypass in the log;
 //   - verified caller that is not an orchestrator of the owner's project (a
 //     worker, or another project's orchestrator): ErrPipelineMergeForbidden in
 //     every mode but off;
@@ -64,9 +66,14 @@ func (s *ActionService) enforcePipeline(ctx context.Context, req MergeRequest, t
 	if mode == domain.PipelineEnforceOff || !status.Stage.Enforced() {
 		return "", nil
 	}
-	violation := pipelineViolation(status, head)
+	violation := pipelineViolation(status, head, tracked)
 
 	caller := req.Caller
+	if caller.Untrusted() {
+		s.logger.Warn("pipeline merge refused: caller named a session it could not prove",
+			"pr", tracked.URL, "session", tracked.SessionID, "caller", caller.SessionID)
+		return "", ErrPipelineMergeForbidden
+	}
 	if !caller.Verified || strings.TrimSpace(caller.SessionID) == "" {
 		if violation != "" && mode == domain.PipelineEnforceOn {
 			s.logger.Info("pipeline merge bypass by unverified caller",
@@ -100,11 +107,25 @@ func (s *ActionService) enforcePipeline(ctx context.Context, req MergeRequest, t
 }
 
 // pipelineViolation names why the session is not mergeable, or "" when it is
-// ready on the head being merged.
-func pipelineViolation(status pipeline.Status, head string) string {
+// ready on the head being merged. A merged session is terminal: only the PR the
+// pipeline merged (already merged, or on the last gated head) is clean, so a
+// second PR from the same session cannot ride on the first one's approval.
+func pipelineViolation(status pipeline.Status, head string, tracked domain.PullRequest) string {
 	switch status.Stage {
 	case domain.PipelineStageMerged:
-		return ""
+		if tracked.Merged {
+			return ""
+		}
+		var last string
+		for _, g := range status.Gates {
+			if g.HeadSHA != "" {
+				last = g.HeadSHA // gates are listed oldest first; keep the newest
+			}
+		}
+		if last != "" && strings.EqualFold(last, head) {
+			return ""
+		}
+		return "the pipeline already merged this task; this PR is not the one it merged"
 	case domain.PipelineStageReady:
 	default:
 		return fmt.Sprintf("stage is %q, not %q", status.Stage, domain.PipelineStageReady)

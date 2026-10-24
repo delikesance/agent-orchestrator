@@ -173,7 +173,10 @@ func (m *Manager) notifyParent(ctx context.Context, child domain.SessionRecord, 
 		return
 	}
 	parent, ok, err := m.store.GetSession(ctx, child.ParentSessionID)
-	if err != nil || !ok || parent.IsTerminated {
+	// Only a worker parent integrates a child's branch itself. An orchestrator
+	// gets pipeline notices instead; a "git merge" hint here would bypass the
+	// pipeline merge guard.
+	if err != nil || !ok || parent.IsTerminated || parent.Kind != domain.KindWorker {
 		return
 	}
 	if !m.childNotices.reserve(child.ID, status) {

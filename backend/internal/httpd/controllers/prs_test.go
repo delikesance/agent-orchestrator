@@ -172,7 +172,7 @@ func TestPRsRoutes_Merge_PassesVerifiedCaller(t *testing.T) {
 		t.Fatalf("verified caller = %#v", got.Caller)
 	}
 	got = do(map[string]string{sessionauth.HeaderSession: "orch-1", sessionauth.HeaderSessionToken: "forged"})
-	if got.Caller != (sessionauth.Caller{SessionID: "orch-1"}) {
+	if got.Caller != (sessionauth.Caller{SessionID: "orch-1", Claimed: true}) {
 		t.Fatalf("forged caller = %#v", got.Caller)
 	}
 	if got = do(nil); got.Caller != (sessionauth.Caller{}) {

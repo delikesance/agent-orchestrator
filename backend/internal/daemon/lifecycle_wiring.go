@@ -381,6 +381,7 @@ func startSession(ctx context.Context, cfg config.Config, runtime runtimeselect.
 		Projects:   store,
 		Launcher: reviewcore.NewLauncher(reviewers, runtime, cfg.DataDir,
 			reviewcore.WithRunFilePath(cfg.RunFilePath),
+			reviewcore.WithSessionSecret(sessionauth.DaemonSecret(cfg.DataDir, log)),
 			reviewcore.WithAgentAuth(reviewerAgentAuth{readiness: agentReadiness}),
 			reviewcore.WithReviewerChat(reviewerChat)),
 
@@ -390,6 +391,7 @@ func startSession(ctx context.Context, cfg config.Config, runtime runtimeselect.
 		reviewsvc.WithTelemetry(telemetry),
 		reviewsvc.WithNotificationSink(notifications),
 		reviewsvc.WithCodexAccountOperationGate(codexOperationGate),
+		reviewsvc.WithSessionSecret(sessionauth.DaemonSecret(cfg.DataDir, log)),
 	}
 	if scmProvider != nil {
 		reviewOpts = append(reviewOpts,
