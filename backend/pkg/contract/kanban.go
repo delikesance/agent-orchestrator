@@ -45,6 +45,11 @@ type KanbanSessionFacts struct {
 	AutoReview        bool
 	AutoInjectReview  bool
 	AutoInjectCI      bool
+	// PipelineStage is the session's mandatory-pipeline stage (building,
+	// validating, review, ready, merged, escalated). Empty for a legacy session,
+	// whose placement is then derived exactly as before. A non-empty stage is a
+	// ceiling on the derived lane, never a promotion.
+	PipelineStage string
 }
 
 // KanbanReviewRunFacts summarize AO's own review passes against one PR's
@@ -229,6 +234,52 @@ const (
 type KanbanPresentation struct {
 	Column        KanbanColumn
 	DisplayStatus DisplayStatus
+	// Escalated reports a session whose pipeline gave up after its retry cap.
+	// It stays on the lane it was escalated from; clients badge it.
+	Escalated bool
+}
+
+// Pipeline stage values the lane ceiling understands.
+const (
+	pipelineStageBuilding   = "building"
+	pipelineStageValidating = "validating"
+	pipelineStageReview     = "review"
+	pipelineStageReady      = "ready"
+	pipelineStageMerged     = "merged"
+	pipelineStageEscalated  = "escalated"
+)
+
+func kanbanLaneRank(column KanbanColumn) int {
+	switch column {
+	case KanbanBuilding:
+		return 0
+	case KanbanValidating:
+		return 1
+	case KanbanNeedsReview:
+		return 2
+	case KanbanReady:
+		return 3
+	default:
+		return 4
+	}
+}
+
+// pipelineCeiling returns the highest lane a pipeline stage allows, and
+// whether the stage caps anything. Merged and escalated cap nothing: merged
+// keeps the existing merged handling and escalated stays on its source lane.
+func pipelineCeiling(stage string) (KanbanColumn, bool) {
+	switch stage {
+	case pipelineStageBuilding:
+		return KanbanBuilding, true
+	case pipelineStageValidating:
+		return KanbanValidating, true
+	case pipelineStageReview:
+		return KanbanNeedsReview, true
+	case pipelineStageReady:
+		return KanbanReady, true
+	default:
+		return "", false
+	}
 }
 
 // DeriveKanbanPresentation derives a session's board placement and the phrase
@@ -239,26 +290,57 @@ type KanbanPresentation struct {
 // With several PRs the column is picked per PR and ranked, and the winning PR
 // is the one whose facts the display status reads. A merged or closed PR
 // therefore cannot speak for a session that still has live work.
+//
+// A non-empty session.PipelineStage caps the lane (see pipelineCeiling) and an
+// escalated stage sets Escalated; with an empty stage the result is the legacy
+// derivation unchanged.
 func DeriveKanbanPresentation(
 	session KanbanSessionFacts,
 	prs []KanbanPRFacts,
 	now time.Time,
 	noSignalGrace time.Duration,
 ) KanbanPresentation {
+	presentation, chosen := deriveLegacyKanbanPresentation(session, prs, now, noSignalGrace)
+	if session.PipelineStage == "" || session.IsTerminated {
+		return presentation
+	}
+	if session.PipelineStage == pipelineStageEscalated {
+		presentation.Escalated = true
+		return presentation
+	}
+	// A PR merged or closed on GitHub is a terminal fact the pipeline cannot
+	// hold back: the legacy lane wins so the card is not stranded below ready.
+	if chosen.Merged || chosen.Closed {
+		return presentation
+	}
+	ceiling, capped := pipelineCeiling(session.PipelineStage)
+	if capped && kanbanLaneRank(presentation.Column) > kanbanLaneRank(ceiling) {
+		presentation.Column = ceiling
+		presentation.DisplayStatus = displayStatusInColumn(ceiling, session, chosen, now, noSignalGrace)
+	}
+	return presentation
+}
+
+func deriveLegacyKanbanPresentation(
+	session KanbanSessionFacts,
+	prs []KanbanPRFacts,
+	now time.Time,
+	noSignalGrace time.Duration,
+) (KanbanPresentation, KanbanPRFacts) {
 	if session.IsTerminated {
-		return KanbanPresentation{Column: KanbanArchive, DisplayStatus: DisplayTerminated}
+		return KanbanPresentation{Column: KanbanArchive, DisplayStatus: DisplayTerminated}, KanbanPRFacts{}
 	}
 	if len(prs) == 0 && session.HasArtifactOutput {
 		return KanbanPresentation{
 			Column:        KanbanValidating,
 			DisplayStatus: artifactDisplayStatus(session, now, noSignalGrace),
-		}
+		}, KanbanPRFacts{}
 	}
 	if len(prs) == 0 {
 		return KanbanPresentation{
 			Column:        KanbanBuilding,
 			DisplayStatus: buildingDisplayStatus(session, now, noSignalGrace),
-		}
+		}, KanbanPRFacts{}
 	}
 	// A terminal PR must not hide a live one still moving through either loop;
 	// merged/closed placements count only once nothing is live.
@@ -278,7 +360,7 @@ func DeriveKanbanPresentation(
 	return KanbanPresentation{
 		Column:        column,
 		DisplayStatus: displayStatusInColumn(column, session, chosen, now, noSignalGrace),
-	}
+	}, chosen
 }
 
 func displayStatusInColumn(

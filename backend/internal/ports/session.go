@@ -28,6 +28,11 @@ type SpawnConfig struct {
 	// through `ao spawn`. The daemon validates this reference and derives any
 	// inherited settings itself; callers never supply an inherited policy.
 	ParentSessionID domain.SessionID
+	// ParentVerified is set by the HTTP layer when ParentSessionID is the
+	// session whose per-session token authenticated the request. False means
+	// the parent is only a claim (a forgeable AO_SESSION_ID); the manager
+	// refuses an unverified worker parent when strict mode is on.
+	ParentVerified bool
 	// TrackerProvider is the issue-tracker provider hint from the CLI's
 	// --tracker-provider flag (defaults to "github"). It is used as a fallback
 	// when the project's SCM origin cannot be classified by the configured
@@ -53,6 +58,9 @@ type SpawnConfig struct {
 	// AgentAccountID is the provider account the agent runs under. Empty uses
 	// the provider's default account.
 	AgentAccountID string
+	// Tier is an optional request-scoped speed/depth hint. Empty means absent.
+	// Resolution to model and effort happens in the session manager.
+	Tier domain.WorkerTier
 
 	// RequestedMode is the caller's explicit session mode, or empty to let the
 	// daemon resolve its default. It is validated and persisted before any

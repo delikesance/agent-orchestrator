@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd"
 	prsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/pr"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 )
 
 type fakePRService struct {
@@ -119,6 +121,63 @@ func TestPRsRoutes_Merge_422(t *testing.T) {
 	body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/1/merge", validMergeBody)
 	assertJSON(t, headers)
 	assertErrorCode(t, body, status, http.StatusUnprocessableEntity, "PR_PRECONDITIONS_UNMET")
+}
+
+// ---- Merge: pipeline enforcement ----
+
+func TestPRsRoutes_Merge_PipelineErrors(t *testing.T) {
+	for _, tc := range []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{prsvc.ErrPipelineMergeForbidden, http.StatusForbidden, "PIPELINE_MERGE_FORBIDDEN"},
+		{prsvc.ErrPipelineNotReady, http.StatusConflict, "PIPELINE_NOT_READY"},
+	} {
+		srv := newPRTestServer(t, &fakePRService{mergeErr: tc.err})
+		body, status, headers := doRequest(t, srv, "POST", "/api/v1/prs/1/merge", validMergeBody)
+		assertJSON(t, headers)
+		assertErrorCode(t, body, status, tc.status, tc.code)
+	}
+}
+
+func TestPRsRoutes_Merge_PassesVerifiedCaller(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	do := func(headers map[string]string) prsvc.MergeRequest {
+		svc := &fakePRService{mergeResult: prsvc.MergeResult{PRNumber: 42, Method: "squash", State: domain.PRStateMerged}}
+		log := slog.New(slog.NewTextHandler(io.Discard, nil))
+		srv := httptest.NewServer(httpd.NewRouterWithControl(config.Config{}, log, nil, httpd.APIDeps{PRs: svc, SessionSecret: secret}, httpd.ControlDeps{}))
+		t.Cleanup(srv.Close)
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/prs/42/merge", strings.NewReader(validMergeBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		return svc.mergeRequest
+	}
+
+	got := do(map[string]string{sessionauth.HeaderSession: "orch-1", sessionauth.HeaderSessionToken: sessionauth.Issue(secret, "orch-1")})
+	if got.Caller != (sessionauth.Caller{SessionID: "orch-1", Verified: true}) {
+		t.Fatalf("verified caller = %#v", got.Caller)
+	}
+	got = do(map[string]string{sessionauth.HeaderSession: "orch-1", sessionauth.HeaderSessionToken: "forged"})
+	if got.Caller != (sessionauth.Caller{SessionID: "orch-1", Claimed: true}) {
+		t.Fatalf("forged caller = %#v", got.Caller)
+	}
+	if got = do(nil); got.Caller != (sessionauth.Caller{}) {
+		t.Fatalf("human caller = %#v", got.Caller)
+	}
 }
 
 // ---- ResolveComments: 200 ----

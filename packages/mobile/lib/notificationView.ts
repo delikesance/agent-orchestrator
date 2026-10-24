@@ -6,7 +6,7 @@ import type { MachineAppearance } from "./machineAppearance";
 
 export type NotificationVisual = {
 	/** lucide icon names, drawn from the renderer's own path data. */
-	icon: "message-square-dot" | "git-pull-request-arrow" | "git-merge" | "git-pull-request-closed" | "bell";
+	icon: "message-square-dot" | "git-pull-request-arrow" | "git-merge" | "git-pull-request-closed" | "circle-alert" | "bell";
 	color: string;
 	label: string;
 };
@@ -102,7 +102,7 @@ export function notificationTarget(n: { type: string; sessionId?: string; hostId
 	if ((n.type === "review_completed" || n.type === "review_changes_requested") && sessionId && n.prUrl) {
 		return `/review/${encodeURIComponent(sessionId)}?prUrl=${encodeURIComponent(n.prUrl)}&hostId=${hostId}`;
 	}
-	return n.type === "needs_input" && sessionId ? `/session/${encodeURIComponent(sessionId)}?hostId=${hostId}` : `/prs?hostId=${hostId}`;
+	return (n.type === "needs_input" || n.type === "pipeline_escalated") && sessionId ? `/session/${encodeURIComponent(sessionId)}?hostId=${hostId}` : `/prs?hostId=${hostId}`;
 }
 
 /** Compact "3m" / "4h" / "2d" stamp. Returns "" for an unparseable timestamp. */

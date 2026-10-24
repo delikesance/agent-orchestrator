@@ -263,6 +263,7 @@ type ListSessionsQuery struct {
 	Active           *bool  `query:"active,omitempty" description:"When true, return non-terminated sessions; when false, return terminated sessions."`
 	OrchestratorOnly *bool  `query:"orchestratorOnly,omitempty" description:"When true, return only orchestrator sessions."`
 	Fresh            *bool  `query:"fresh,omitempty" description:"When true, return only fresh non-terminated sessions."`
+	ParentSessionID  string `query:"parentSessionId,omitempty" description:"When set, return only direct children of this parent session."`
 }
 
 // CleanupSessionsQuery is the query string accepted by POST /api/v1/sessions/cleanup.
@@ -463,6 +464,13 @@ type SessionView struct {
 	// Model is the agent model this session resolved to at spawn time. Empty
 	// means the agent's default model. Pulled from the json:"-" domain Metadata.
 	Model string `json:"model,omitempty"`
+	// Tier is the worker tier the session launched with (fast, standard, deep).
+	// Omitted when unset; consumers treat empty as standard. Pulled from the
+	// json:"-" domain Metadata.
+	Tier string `json:"tier,omitempty"`
+	// Effort is the reasoning effort resolved with Model at spawn time. Omitted
+	// when unset. Pulled from the json:"-" domain Metadata.
+	Effort string `json:"effort,omitempty"`
 	// LastUserMessageAt is the latest real user-authored task direction time.
 	// Lifecycle and internal automation updates do not advance it.
 	LastUserMessageAt *time.Time `json:"lastUserMessageAt,omitempty"`
@@ -474,6 +482,9 @@ type SessionView struct {
 	LastEventAt   time.Time             `json:"lastEventAt"`
 	PRs           []SessionPRFacts      `json:"prs"`
 	ArtifactFiles []SessionArtifactView `json:"artifactFiles,omitempty"`
+	// Pipeline is the read-only delivery pipeline block. Omitted for legacy
+	// sessions that no gate applies to.
+	Pipeline *SessionPipelineView `json:"pipeline,omitempty"`
 }
 
 // SessionArtifactView is one inferred file artifact for a session.
@@ -531,6 +542,9 @@ type SpawnSessionRequest struct {
 	Model string `json:"model,omitempty" maxLength:"256"`
 	// Effort is the optional reasoning level for the selected model.
 	Effort string `json:"effort,omitempty" maxLength:"32"`
+	// Tier is an optional speed/depth hint resolved to a model and effort by the
+	// daemon. Explicit model or effort overrides win over it.
+	Tier domain.WorkerTier `json:"tier,omitempty" enum:"fast,standard,deep"`
 
 	// RequestedOutput asks for a specific deliverable. artifact tells the worker to
 	// write a file in its artifact directory instead of opening a PR. Omitted is
@@ -570,6 +584,13 @@ type SpawnSessionResponse struct {
 	Session           SessionView `json:"session"`
 	PromptBytes       int         `json:"promptBytes"`
 	SystemPromptBytes int         `json:"systemPromptBytes"`
+	// TierApplied reports whether the requested tier chose the model or effort.
+	// It is present (true or false) whenever the request named a tier and absent
+	// otherwise, so a tier that was not applied stays distinct from no tier
+	// requested. Warnings is likewise present only when the request named a tier.
+	TierApplied *bool `json:"tierApplied,omitempty"`
+	// Warnings explain why a requested tier was only partly honored.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // StageSessionAttachmentsRequest attaches files to a session that is already
@@ -1238,6 +1259,9 @@ type DelegateTaskRequest struct {
 	// TaskPreparation is the opaque worktree token returned while the New Task
 	// dialog is open. Missing or expired tokens fall back to normal creation.
 	TaskPreparation string `json:"taskPreparation,omitempty"`
+	// Tier is an optional speed/depth hint resolved to a model and effort by the
+	// daemon; an explicit model or effort wins over it.
+	Tier domain.WorkerTier `json:"tier,omitempty" enum:"fast,standard,deep"`
 }
 
 // PrepareTaskResponse returns the opaque token for a speculative task workspace.
@@ -2227,7 +2251,7 @@ type NotificationResponse struct {
 	SessionID string    `json:"sessionId"`
 	ProjectID string    `json:"projectId"`
 	PRURL     string    `json:"prUrl"`
-	Type      string    `json:"type" enum:"needs_input,ready_to_merge,pr_merged,pr_closed_unmerged,review_completed,review_changes_requested"`
+	Type      string    `json:"type" enum:"needs_input,ready_to_merge,pr_merged,pr_closed_unmerged,review_completed,review_changes_requested,pipeline_escalated"`
 	Title     string    `json:"title"`
 	Body      string    `json:"body"`
 	Status    string    `json:"status" enum:"unread,read" description:"Seen state. unread means the user has not opened the notification panel since it arrived."`
@@ -2437,6 +2461,9 @@ type MergePRResponse struct {
 	Method         string         `json:"method"`
 	State          domain.PRState `json:"state" enum:"merged"`
 	StateChangedAt time.Time      `json:"stateChangedAt"`
+	// PipelineWarning is set only when the merge was allowed in pipeline warn
+	// mode despite a violation.
+	PipelineWarning string `json:"pipelineWarning,omitempty" description:"Set when the merge was allowed in pipeline warn mode despite a violation; names the violation."`
 }
 
 // ResolveCommentsRequest is the optional body of POST /api/v1/prs/{id}/resolve-comments.
@@ -3561,6 +3588,9 @@ type TriggerReviewRequest struct {
 	RejectReviewedHead bool `json:"rejectReviewedHead,omitempty" description:"Return 409 instead of reusing when every open PR head is already being reviewed or already has a review."`
 	Rerun              bool `json:"rerun,omitempty" description:"Start a fresh pass for already-reviewed current heads; a different reviewer may run alongside one that is still running. A person's rerun reuses an active pass from the same reviewer; an agent's rerun returns 409 REVIEW_ALREADY_RUNNING instead."`
 	EnableAutoInject   bool `json:"enableAutoInject,omitempty" description:"Turn on the worker session's review auto-inject once a pass has started, so the reviewer's PR review comments reach the worker."`
+	// Target selects what the pass reviews. Omitted or "pr" reviews the worker's
+	// pull requests; "branch" reviews the session branch head against its base.
+	Target string `json:"target,omitempty" enum:"pr,branch" description:"What the pass reviews: pr (the worker's pull requests, the default) or branch (the session branch head against its base, for a session with no PR)."`
 }
 
 // ResolveReviewCommentRequest is the body of POST /api/v1/sessions/{sessionId}/reviews/comments/resolve.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 )
 
 const (
@@ -72,6 +75,7 @@ type triggerReviewRequest struct {
 	RejectReviewedHead bool               `json:"rejectReviewedHead,omitempty"`
 	Rerun              bool               `json:"rerun,omitempty"`
 	EnableAutoInject   bool               `json:"enableAutoInject,omitempty"`
+	Target             string             `json:"target,omitempty"`
 }
 
 // reviewAgentConfig mirrors the model/effort subset of domain.AgentConfig a
@@ -126,6 +130,7 @@ type reviewTriggerOptions struct {
 	effort   string
 	rerun    bool
 	noInject bool
+	target   string
 }
 
 // envReviewSessionID is set only inside reviewer panes (see
@@ -296,6 +301,16 @@ func (c *commandContext) submitReviewBatch(cmd *cobra.Command, session string, o
 	return err
 }
 
+// reviewTokenHeaders carries the reviewer's AO_REVIEW_TOKEN, present only in a
+// reviewer pane. The daemon requires it to accept a verdict on a pipeline
+// session, so a worker cannot submit one for its own review run.
+func reviewTokenHeaders() map[string]string {
+	if token := strings.TrimSpace(os.Getenv(sessionauth.EnvReviewToken)); token != "" {
+		return map[string]string{sessionauth.HeaderReviewToken: token}
+	}
+	return nil
+}
+
 // postReviewJSON retries only transport-level daemon unavailability. The
 // service accepts an identical completed result idempotently, so replay is safe
 // even when a connection drops after the daemon committed the first request.
@@ -306,7 +321,7 @@ func (c *commandContext) postReviewJSON(ctx context.Context, path string, body s
 
 	var lastErr error
 	for {
-		err := c.postJSON(retryCtx, path, body, out)
+		err := c.doJSONPathWithHeaders(retryCtx, http.MethodPost, "/api/v1/"+path, body, out, reviewTokenHeaders())
 		if err == nil {
 			return nil
 		}
@@ -390,6 +405,7 @@ approval and does not authorize merging.`,
 	f.StringVar(&opts.model, "model", "", "Reviewer model for this pass only")
 	f.StringVar(&opts.effort, "effort", "", "Reviewer reasoning effort for this pass only")
 	f.BoolVar(&opts.rerun, "rerun", false, "Review heads that already have a review again, or add another reviewer alongside a running one")
+	f.StringVar(&opts.target, "target", "", "What to review: pr (the session's pull requests, the default) or branch (the session branch head against its base, for a session with no PR)")
 	f.BoolVar(&opts.noInject, "no-inject", false, "Leave the session's review auto-inject setting unchanged")
 	return cmd
 }
@@ -402,7 +418,12 @@ func (c *commandContext) triggerReview(cmd *cobra.Command, args []string, opts r
 	if session == "" {
 		return usageError{errors.New("usage: worker session id is required (positional or --session) outside an AO session")}
 	}
+	target := strings.ToLower(strings.TrimSpace(opts.target))
+	if target != "" && target != "pr" && target != "branch" {
+		return usageError{fmt.Errorf("invalid --target %q: use pr or branch", opts.target)}
+	}
 	req := triggerReviewRequest{
+		Target:             target,
 		Harness:            strings.TrimSpace(opts.harness),
 		PRURL:              strings.TrimSpace(opts.prURL),
 		RejectReviewedHead: !opts.rerun,

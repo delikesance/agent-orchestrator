@@ -166,6 +166,9 @@ const (
 type SessionMetadata struct {
 	// Permissions pins the resolved launch policy independently of future project defaults.
 	Permissions PermissionMode `json:"permissions,omitempty"`
+	// Tier is the worker tier the session launched with (fast, standard, deep).
+	// Empty means none was recorded and reads as standard.
+	Tier string `json:"tier,omitempty"`
 
 	Branch            string `json:"branch,omitempty"`
 	WorkspacePath     string `json:"workspacePath,omitempty"`
@@ -301,7 +304,24 @@ type SessionRecord struct {
 	// surfaces as StatusNoSignal after a grace period. Internal fact, not part
 	// of the API read model.
 	FirstSignalAt time.Time `json:"-"`
+	// TierApplied and TierWarning are set only on the record a spawn returns:
+	// whether the requested worker tier supplied a model or effort, and why a
+	// fast or deep tier changed nothing. They are not persisted.
+	TierApplied   bool      `json:"-"`
+	TierWarning   string    `json:"-"`
 	IsTerminated  bool      `json:"isTerminated"`
+	// ParentSessionID is the session that spawned this one; empty for a
+	// top-level session. Fixed at insertion and read-only in the API.
+	ParentSessionID SessionID `json:"parentSessionId,omitempty"`
+	// Depth is the spawn distance from the orchestrator (orchestrator 0, its
+	// workers 1, their children 2). Fixed at insertion and read-only in the API.
+	Depth int `json:"depth"`
+	// PipelineStage and PipelineAttempt are the daemon-owned delivery pipeline
+	// position (docs/plans/mandatory-pipeline.md). Empty stage is a legacy,
+	// unenforced session. Never accepted from or echoed by a request DTO; only
+	// the pipeline service writes them, through the store's compare-and-set.
+	PipelineStage   PipelineStage `json:"-"`
+	PipelineAttempt int           `json:"-"`
 	// HibernatedAt records that the idle Chat controller was stopped while the
 	// session and conversation remain resumable. Nil means no recorded hibernation.
 	HibernatedAt *time.Time `json:"hibernatedAt,omitempty"`

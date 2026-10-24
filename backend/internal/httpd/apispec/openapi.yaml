@@ -5373,6 +5373,12 @@ paths:
           type:
           - "null"
           - boolean
+      - description: When set, return only direct children of this parent session.
+        in: query
+        name: parentSessionId
+        schema:
+          description: When set, return only direct children of this parent session.
+          type: string
       responses:
         "200":
           content:
@@ -5422,6 +5428,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/APIError'
           description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
         "500":
           content:
             application/json:
@@ -8874,6 +8886,142 @@ paths:
                 $ref: '#/components/schemas/APIError'
           description: Not Implemented
       summary: Pin a session
+      tags:
+      - sessions
+  /api/v1/sessions/{sessionId}/pipeline:
+    get:
+      operationId: getSessionPipeline
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineStatusResponse'
+          description: OK
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Get a session's delivery pipeline status with full gate evidence
+      tags:
+      - sessions
+  /api/v1/sessions/{sessionId}/pipeline/override:
+    post:
+      operationId: overrideSessionPipeline
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PipelineOverrideRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineActionResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Override an escalated session's pipeline to ready (a person only)
+      tags:
+      - sessions
+  /api/v1/sessions/{sessionId}/pipeline/retry:
+    post:
+      operationId: retrySessionPipeline
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineActionResponse'
+          description: OK
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Retry an escalated session's pipeline (orchestrator of the project
+        or a person)
       tags:
       - sessions
   /api/v1/sessions/{sessionId}/pr:
@@ -15043,6 +15191,8 @@ components:
         createdAt:
           format: date-time
           type: string
+        depth:
+          type: integer
         displayName:
           type: string
         displayStatus:
@@ -15070,6 +15220,8 @@ components:
           - Merged
           - Closed without merge
           - Terminated
+          type: string
+        effort:
           type: string
         harness:
           type: string
@@ -15123,11 +15275,15 @@ components:
           - artifact
           - pr_artifact
           type: string
+        parentSessionId:
+          type: string
         pinnedAt:
           format: date-time
           type:
           - "null"
           - string
+        pipeline:
+          $ref: '#/components/schemas/SessionPipeline'
         previewRevision:
           format: int64
           type: integer
@@ -15226,6 +15382,8 @@ components:
           type: string
         terminateOnPrMerge:
           type: boolean
+        tier:
+          type: string
         updatedAt:
           format: date-time
           type: string
@@ -15244,6 +15402,7 @@ components:
       - mode
       - activity
       - isTerminated
+      - depth
       - terminateOnPrMerge
       - autoInjectReview
       - autoInjectCI
@@ -16279,6 +16438,12 @@ components:
         projectId:
           type: string
         taskPreparation:
+          type: string
+        tier:
+          enum:
+          - fast
+          - standard
+          - deep
           type: string
       required:
       - projectId
@@ -17447,6 +17612,10 @@ components:
           type: string
         ok:
           type: boolean
+        pipelineWarning:
+          description: Set when the merge was allowed in pipeline warn mode despite
+            a violation; names the violation.
+          type: string
         prNumber:
           type: integer
         state:
@@ -17647,6 +17816,7 @@ components:
           - pr_closed_unmerged
           - review_completed
           - review_changes_requested
+          - pipeline_escalated
           type: string
       required:
       - id
@@ -17751,6 +17921,145 @@ components:
       - title
       - targetSha
       - status
+      type: object
+    PipelineActionResponse:
+      properties:
+        attempt:
+          type: integer
+        from:
+          type: string
+        maxAttempts:
+          type: integer
+        sessionId:
+          type: string
+        to:
+          type: string
+      required:
+      - sessionId
+      - from
+      - to
+      - attempt
+      - maxAttempts
+      type: object
+    PipelineConfig:
+      properties:
+        enabled:
+          type:
+          - "null"
+          - boolean
+        enforce:
+          enum:
+          - "off"
+          - warn
+          - "on"
+          type: string
+        maxAttempts:
+          type: integer
+        reviewerTier:
+          enum:
+          - fast
+          - standard
+          - deep
+          type: string
+        validation:
+          enum:
+          - commands
+          - ci-only
+          type: string
+        validationCommands:
+          items:
+            type: string
+          type: array
+      type: object
+    PipelineGateDetail:
+      properties:
+        attempt:
+          type: integer
+        createdAt:
+          format: date-time
+          type: string
+        evidence:
+          description: The gate's stored evidence document as a JSON string, including
+            command output tails.
+          type: string
+        evidenceSummary:
+          description: One-line summary of the gate evidence; the raw output is only
+            on GET /sessions/{sessionId}/pipeline.
+          type: string
+        headSha:
+          type: string
+        result:
+          enum:
+          - pass
+          - fail
+          - override
+          type: string
+        reviewRunId:
+          type: string
+        stage:
+          enum:
+          - validating
+          - review
+          type: string
+      required:
+      - stage
+      - attempt
+      - result
+      - headSha
+      - createdAt
+      type: object
+    PipelineOverrideRequest:
+      properties:
+        reason:
+          description: Why the escalated session is accepted as is. Recorded on the
+            override gate.
+          type: string
+      required:
+      - reason
+      type: object
+    PipelineStatusResponse:
+      properties:
+        attempt:
+          type: integer
+        blocking:
+          description: True when a merge of this session is currently blocked.
+          type: boolean
+        enforce:
+          enum:
+          - "off"
+          - warn
+          - "on"
+          type: string
+        enforced:
+          type: boolean
+        gates:
+          items:
+            $ref: '#/components/schemas/PipelineGateDetail'
+          type: array
+        maxAttempts:
+          type: integer
+        sessionId:
+          type: string
+        stage:
+          description: Empty for a legacy session the pipeline does not apply to.
+          enum:
+          - ""
+          - building
+          - validating
+          - review
+          - ready
+          - merged
+          - escalated
+          type: string
+      required:
+      - sessionId
+      - stage
+      - attempt
+      - maxAttempts
+      - enforce
+      - enforced
+      - blocking
+      - gates
       type: object
     PrepareTaskResponse:
       properties:
@@ -17894,6 +18203,8 @@ components:
           $ref: '#/components/schemas/RoleOverride'
         orchestratorRules:
           type: string
+        pipeline:
+          $ref: '#/components/schemas/PipelineConfig'
         postCreate:
           items:
             type: string
@@ -19253,6 +19564,73 @@ components:
       - count
       - links
       type: object
+    SessionPipeline:
+      properties:
+        attempt:
+          type: integer
+        enforce:
+          description: 'Rollout mode: off records nothing, warn records gates but
+            never blocks a merge, on blocks a merge until the session is ready.'
+          enum:
+          - "off"
+          - warn
+          - "on"
+          type: string
+        gates:
+          items:
+            $ref: '#/components/schemas/SessionPipelineGate'
+          type: array
+        maxAttempts:
+          type: integer
+        stage:
+          enum:
+          - building
+          - validating
+          - review
+          - ready
+          - merged
+          - escalated
+          type: string
+      required:
+      - stage
+      - attempt
+      - maxAttempts
+      - enforce
+      - gates
+      type: object
+    SessionPipelineGate:
+      properties:
+        attempt:
+          type: integer
+        createdAt:
+          format: date-time
+          type: string
+        evidenceSummary:
+          description: One-line summary of the gate evidence; the raw output is only
+            on GET /sessions/{sessionId}/pipeline.
+          type: string
+        headSha:
+          type: string
+        result:
+          enum:
+          - pass
+          - fail
+          - override
+          type: string
+        reviewRunId:
+          type: string
+        stage:
+          enum:
+          - validating
+          - review
+          type: string
+      required:
+      - stage
+      - attempt
+      - result
+      - headSha
+      - createdAt
+      type: object
     SessionPreviewResponse:
       properties:
         entry:
@@ -20321,6 +20699,12 @@ components:
           enum:
           - artifact
           type: string
+        tier:
+          enum:
+          - fast
+          - standard
+          - deep
+          type: string
         trackerProvider:
           enum:
           - github
@@ -20335,6 +20719,14 @@ components:
           $ref: '#/components/schemas/ControllersSessionView'
         systemPromptBytes:
           type: integer
+        tierApplied:
+          type:
+          - "null"
+          - boolean
+        warnings:
+          items:
+            type: string
+          type: array
       required:
       - session
       - promptBytes
@@ -20823,6 +21215,14 @@ components:
           enum:
           - manual
           - agent
+          type: string
+        target:
+          description: 'What the pass reviews: pr (the worker''s pull requests, the
+            default) or branch (the session branch head against its base, for a session
+            with no PR).'
+          enum:
+          - pr
+          - branch
           type: string
       type: object
     TriggerReviewResponse:

@@ -34,6 +34,9 @@ var (
 	ErrReviewAlreadyRunning = reviewcore.ErrReviewAlreadyRunning
 	ErrHeadAlreadyReviewed  = reviewcore.ErrHeadAlreadyReviewed
 	ErrPROwnedElsewhere     = reviewcore.ErrPROwnedElsewhere
+	// ErrStaleReviewTarget means a verdict names a commit that is no longer the
+	// head of the PR or branch it reviewed, so it can no longer approve it.
+	ErrStaleReviewTarget = fmt.Errorf("%w: review target is stale", reviewcore.ErrConflict)
 	ErrAgentBinaryNotFound  = ports.ErrAgentBinaryNotFound
 )
 
@@ -91,11 +94,26 @@ type Service struct {
 	codexOperationGate ports.CodexOperationGate
 	notifications      reviewNotificationSink
 	prRefresher        PRRefresher
+	pipelineHook       PipelineHook
+	pipelineModes      PipelineModes
+	sessionSecret      []byte
 	// engineTrigger indirects the engine's source-tagged trigger so the
 	// instrumented path can be exercised without standing up a full engine and
 	// its eighteen-method store. Defaulted in New; only tests replace it.
 	engineTrigger func(context.Context, domain.SessionID, reviewcore.TriggerOptions) (reviewcore.TriggerResult, error)
 }
+
+// PipelineHook receives every recorded verdict so the mandatory delivery
+// pipeline can advance the session. It is best-effort: it must not block and its
+// outcome never affects the submission.
+type PipelineHook interface {
+	OnReviewVerdict(run domain.ReviewRun)
+}
+
+// SetPipelineHook wires the pipeline's verdict hook; nil unwires it. It is set
+// after construction because the pipeline driver itself triggers reviews
+// through this service.
+func (s *Service) SetPipelineHook(hook PipelineHook) { s.pipelineHook = hook }
 
 type reviewNotificationSink interface {
 	Notify(context.Context, ports.NotificationIntent) error
@@ -437,6 +455,10 @@ type TriggerRequest struct {
 	PRURL              string
 	RejectReviewedHead bool
 	Rerun              bool
+	// Target selects the review mode explicitly: empty or "pr" reviews the
+	// worker's PRs, "branch" reviews the session branch head against its base
+	// for a session with no PR.
+	Target reviewcore.ReviewTargetKind
 	// EnableAutoInject turns on the worker session's review auto-inject once a
 	// pass has started, so the reviewer's PR review comments reach the worker.
 	EnableAutoInject bool
@@ -464,8 +486,10 @@ func (s *Service) TriggerRequested(ctx context.Context, workerID domain.SessionI
 	if req.Rerun && req.RejectReviewedHead {
 		return TriggerOutcome{}, fmt.Errorf("%w: rerun cannot be combined with rejecting an already-reviewed head", ErrInvalid)
 	}
-	if err := s.refreshPRs(ctx, workerID, strings.TrimSpace(req.PRURL)); err != nil {
-		return TriggerOutcome{}, err
+	if req.Target != reviewcore.ReviewTargetBranch {
+		if err := s.refreshPRs(ctx, workerID, strings.TrimSpace(req.PRURL)); err != nil {
+			return TriggerOutcome{}, err
+		}
 	}
 	result, err := s.triggerWithOptions(ctx, workerID, reviewcore.TriggerOptions{
 		Harness:            req.Harness,
@@ -475,6 +499,7 @@ func (s *Service) TriggerRequested(ctx context.Context, workerID domain.SessionI
 		PRURL:              strings.TrimSpace(req.PRURL),
 		RejectReviewedHead: req.RejectReviewedHead,
 		Rerun:              req.Rerun,
+		Target:             req.Target,
 	})
 	if err != nil {
 		return TriggerOutcome{}, err
@@ -758,10 +783,18 @@ func (s *Service) SubmitMany(ctx context.Context, workerID domain.SessionID, rev
 		return nil, fmt.Errorf("review service store is not configured")
 	}
 	runs := make([]domain.ReviewRun, 0, len(reviews))
-	var supersededRunIDs []string
+	var supersededRunIDs, staleRunIDs []string
+	var staleErr error
 	for _, review := range reviews {
 		run, err := s.submitOne(ctx, workerID, review)
 		if err != nil {
+			// A verdict for a commit that is no longer the head must never be
+			// recorded, but like a superseded run it must not strand siblings.
+			if errors.Is(err, ErrStaleReviewTarget) {
+				staleRunIDs = append(staleRunIDs, review.RunID)
+				staleErr = err
+				continue
+			}
 			// A newer trigger or lifecycle cancellation may have made one queued
 			// run terminal while the reviewer was working. That run is no longer
 			// submittable, but it must not prevent valid siblings from delivery.
@@ -774,6 +807,9 @@ func (s *Service) SubmitMany(ctx context.Context, workerID domain.SessionID, rev
 		runs = append(runs, run)
 	}
 	if len(runs) == 0 {
+		if len(staleRunIDs) > 0 {
+			return nil, fmt.Errorf("no review run in the submission targets the current head (stale: %s): %w", strings.Join(staleRunIDs, ", "), staleErr)
+		}
 		if len(supersededRunIDs) > 0 {
 			return nil, fmt.Errorf("%w: no submittable review runs in submission (superseded: %s)", ErrInvalid, strings.Join(supersededRunIDs, ", "))
 		}
@@ -783,6 +819,11 @@ func (s *Service) SubmitMany(ctx context.Context, workerID domain.SessionID, rev
 	// its review on the provider, and the SCM observer forwards unresolved
 	// review comments to the worker like any other reviewer's. AO does not send
 	// a second, separate verdict message.
+	if s.pipelineHook != nil {
+		for _, run := range runs {
+			s.pipelineHook.OnReviewVerdict(run)
+		}
+	}
 	return runs, nil
 }
 
@@ -810,6 +851,12 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 	if run.SessionID != workerID {
 		return domain.ReviewRun{}, fmt.Errorf("%w: review run %q does not belong to worker %q", ErrInvalid, runID, workerID)
 	}
+	reviewerUnverified, err := s.authorizeSubmit(ctx, run)
+	if err != nil {
+		return domain.ReviewRun{}, err
+	}
+	// Carried to the pipeline hook only (json:"-"); never persisted.
+	run.ReviewerUnverified = reviewerUnverified
 
 	switch run.Status {
 	case domain.ReviewRunRunning:
@@ -819,6 +866,9 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 		}
 		if !found {
 			return domain.ReviewRun{}, fmt.Errorf("%w: worker session %q", ErrNotFound, workerID)
+		}
+		if err := s.checkReviewTargetCurrent(ctx, session, run); err != nil {
+			return domain.ReviewRun{}, err
 		}
 		updated, err := s.store.UpdateReviewRunResult(ctx, run.ID, domain.ReviewRunComplete, verdict, body, githubReviewID, session.AutoInjectReview)
 		if err != nil {
@@ -869,6 +919,72 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 	}
 	s.emitReviewNotification(ctx, run)
 	return run, nil
+}
+
+// checkReviewTargetCurrent rejects a verdict whose run reviewed a commit that
+// is no longer the head, in both modes: a PR run is compared with the PR's
+// current head (refreshed from the provider first when a refresher is wired), a
+// branch-diff run with the commit checked out in the session workspace. A head
+// that cannot be established for a branch run fails closed; a PR AO no longer
+// tracks has no head to compare and passes.
+func (s *Service) checkReviewTargetCurrent(ctx context.Context, session domain.SessionRecord, run domain.ReviewRun) error {
+	if run.TargetSHA == "" {
+		return nil
+	}
+	if run.PRURL != "" {
+		pr, found, err := s.trackedPR(ctx, run.SessionID, run.PRURL)
+		if err != nil {
+			return err
+		}
+		if found && s.prRefresher != nil {
+			rctx, cancel := context.WithTimeout(ctx, prRefreshTimeout)
+			if err := s.prRefresher.RefreshPR(rctx, run.SessionID, firstNonEmpty(pr.HTMLURL, pr.URL)); err != nil {
+				slog.Default().WarnContext(ctx, "review submit: refresh PR failed; using stored head", "session", run.SessionID, "err", err)
+			} else if pr, found, err = s.trackedPR(ctx, run.SessionID, run.PRURL); err != nil {
+				cancel()
+				return err
+			}
+			cancel()
+		}
+		if found && pr.HeadSHA != "" && pr.HeadSHA != run.TargetSHA {
+			return fmt.Errorf("%w: run %q reviewed %s but the PR head is now %s; ask for a new review", ErrStaleReviewTarget, run.ID, shortSHA(run.TargetSHA), shortSHA(pr.HeadSHA))
+		}
+		return nil
+	}
+	head, err := reviewcore.ResolveBranchHead(ctx, session.Metadata.WorkspacePath)
+	if err != nil || head == "" {
+		return fmt.Errorf("%w: run %q reviewed branch head %s but the current head cannot be verified: %v", ErrStaleReviewTarget, run.ID, shortSHA(run.TargetSHA), err)
+	}
+	if head != run.TargetSHA {
+		return fmt.Errorf("%w: run %q reviewed branch head %s but it is now %s; ask for a new review", ErrStaleReviewTarget, run.ID, shortSHA(run.TargetSHA), shortSHA(head))
+	}
+	return nil
+}
+
+func (s *Service) trackedPR(ctx context.Context, id domain.SessionID, prURL string) (domain.PullRequest, bool, error) {
+	prs, err := s.store.ListPRsBySession(ctx, id)
+	if err != nil {
+		return domain.PullRequest{}, false, err
+	}
+	for _, pr := range prs {
+		if pr.URL == prURL || pr.HTMLURL == prURL {
+			return pr, true, nil
+		}
+	}
+	return domain.PullRequest{}, false, nil
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
+}
+
+// ReviewTargetForSession reports what a review of the session targets now (an
+// open PR or the branch) and the head commit a verdict must be bound to.
+func (s *Service) ReviewTargetForSession(ctx context.Context, sessionID domain.SessionID) (reviewcore.ReviewTargetKind, string, error) {
+	return s.engine.ReviewTargetForSession(ctx, sessionID)
 }
 
 func (s *Service) emitReviewNotification(ctx context.Context, run domain.ReviewRun) {

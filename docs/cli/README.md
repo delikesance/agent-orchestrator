@@ -64,8 +64,12 @@ addresses change on restart.
 | `ao automation create/list/get/update/delete/runs` | `POST/GET/PATCH/DELETE /api/v1/automations` |
 | `ao cue create/list`                | `POST/GET /api/v1/projects/{id}/cues`         |
 | `ao spawn`                          | Targeted launch ensure, then `POST /api/v1/sessions` |
-| `ao session ls`                     | `GET /api/v1/sessions` plus per-session PR summaries; shows branch, PR, CI, review, unresolved threads, activity, and age. |
-| `ao session get <id>`               | `GET /api/v1/sessions/{id}`                    |
+| `ao session ls [--children [<id>]]` | `GET /api/v1/sessions` (`--children` adds `parentSessionId`) plus per-session PR summaries; shows branch, PR, CI, review, unresolved threads, activity, and age. |
+| `ao session get <id>`               | `GET /api/v1/sessions/{id}` (prints the `pipeline` block when the session has one) |
+| `ao pipeline status [<id>]`         | `GET /api/v1/sessions/{id}/pipeline` (default `$AO_SESSION_ID`; `--json` includes gate evidence) |
+| `ao pipeline retry <id>`            | `POST /api/v1/sessions/{id}/pipeline/retry`    |
+| `ao pipeline override <id> --reason <text>` | `POST /api/v1/sessions/{id}/pipeline/override` |
+| `ao usage [--by tier\|model] [--project <id>] [--json]` | `GET /api/v1/sessions` joined client-side with `GET /api/v1/usage/sessions` on session id; groups sessions, tokens (input+output) and estimated cost per tier (default, empty tier = `standard`) or model; sessions without usage rows go to `unknown`. Costs are estimates from the price catalog, not the invoice. Invalid `--by` exits 2. |
 | `ao session kill <id>`              | `POST /api/v1/sessions/{id}/kill`              |
 | `ao session restore <id>`           | `POST /api/v1/sessions/{id}/restore`           |
 | `ao session exit-agent <id>`        | `POST /api/v1/sessions/{id}/exit-agent`        |
@@ -141,6 +145,24 @@ daemon validation.
 Standalone spawns require `--agent` because there is no project configuration
 from which to resolve a default harness.
 
+`ao spawn --tier fast|standard|deep` picks a cost tier for the worker (use
+`fast` for small, cheap tasks). It only fills the model/effort that explicit
+`--model`/`--effort` leave empty; `standard` is a no-op and any other value
+exits 2. Daemon `warnings` (e.g. a tier the harness cannot honor) print to
+stderr.
+
+Nested spawns: when `AO_SESSION_ID` is set, the new session is a child of that
+session and always branches from the project base branch (there is no
+`--base-parent`). `ao session ls --children [<id>]` lists only the direct
+children of `<id>`, defaulting to `$AO_SESSION_ID`; passing an id without
+`--children` exits 2. The daemon enforces global caps: nesting depth 2
+(orchestrator = 0), 4 live children per parent and 12 live workers per project
+(`DefaultMaxSpawnDepth`, `DefaultMaxActiveChildren`, `DefaultMaxActiveWorkers`).
+A refused spawn is HTTP 409; `ao spawn` prints the daemon message and code on
+stderr and exits 1. Codes: `SPAWN_DEPTH_EXCEEDED`, `TOO_MANY_CHILDREN`,
+`TOO_MANY_WORKERS`, `TIER_EXCEEDS_PARENT` (child tier above its parent's) and
+`INVALID_PARENT`.
+
 `ao spawn --output artifact` marks a worker whose deliverable is a file rather
 than a pull request. The daemon persists the kind with the session and adds an
 artifact-delivery section to the worker's system prompt, including after
@@ -206,6 +228,43 @@ PR actions are available through `ao pr merge` and
 `ao pr resolve-comments`. Review actions are available through `ao review ls`,
 `ao review trigger` (also `execute` and `restart`), `ao review cancel` (also
 `stop`), and `ao review submit`.
+
+`ao pr merge <n>` is pipeline-aware. From an agent session the CLI sends the
+session identity headers, and the daemon checks them against the PR's owning
+task (project `pipeline.enforce`, default `warn`):
+
+- A worker session can never merge (`403 PIPELINE_MERGE_FORBIDDEN`), nor can an
+  orchestrator of another project.
+- An orchestrator of the same project may merge only a task at stage `ready`
+  whose PR head is the head the reviewer approved. Under `enforce: on` anything
+  else is `409 PIPELINE_NOT_READY`; under `warn` the merge proceeds and the
+  violation is logged; under `off` nothing is checked.
+- A caller without a verified session (the desktop UI, external tools) is
+  treated as the human and is never blocked. Under `on` a not-ready merge is
+  logged as a bypass.
+- Sessions without a pipeline stage (legacy) are never blocked.
+- When a merge is allowed under `warn` despite a violation, the merge response
+  carries `pipelineWarning` naming it; it is absent otherwise.
+
+`ao pipeline` shows and unblocks a session's delivery pipeline (stages
+`building`, `validating`, `review`, `ready`, `merged`, `escalated`):
+
+- `ao pipeline status [<id>]` prints the stage, attempt, enforcement mode and
+  gates. `ao session get` shows the same block, without raw command output.
+- `ao pipeline retry <id>` returns an `escalated` session to `building` with a
+  fresh attempt budget. Allowed for a person and for an orchestrator of the
+  session's project; a worker session gets `403 PIPELINE_FORBIDDEN`.
+- `ao pipeline override <id> --reason <text>` moves an `escalated` session to
+  `ready` and records a gate with result `override` and the reason on the
+  current head, which satisfies the merge check. Human only: any session
+  identity, including an orchestrator, gets `403 PIPELINE_FORBIDDEN`. The
+  reason is required (`400`).
+- Both return `409 PIPELINE_INVALID_STATE` when the session is not `escalated`
+  and `409 PIPELINE_NOT_ENABLED` for a legacy session.
+
+`ao review trigger --target branch` reviews the session branch head against its
+base instead of a PR (for a session with no PR); `--target pr` is the default.
+Any other value is rejected.
 
 ## Configuration
 

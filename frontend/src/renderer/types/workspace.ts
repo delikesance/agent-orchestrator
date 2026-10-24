@@ -1,3 +1,4 @@
+import type { components } from "../../api/schema";
 import { attentionZone as presentationAttentionZone } from "../lib/session-presentation";
 import {
 	AGENT_OPTIONS,
@@ -12,6 +13,8 @@ import {
 } from "@aoagents/product-ui";
 
 import type { ReviewerHarnessId } from "../lib/reviewer-harnesses";
+
+export type SessionPipeline = components["schemas"]["SessionPipeline"];
 
 export { toKanbanColumn, toSessionActivity, toSessionStatus };
 export type { KanbanColumn, SessionActivity, SessionActivityState, SessionStatus };
@@ -154,6 +157,12 @@ export type WorkspaceSession = {
 	 * {@link status} already produced.
 	 */
 	displayStatus?: string;
+	/**
+	 * Read-only delivery-pipeline block. Absent for a legacy session. The lane
+	 * in {@link kanbanColumn} already honours its stage as a ceiling, so the
+	 * client only badges it and never re-derives a lane from it.
+	 */
+	pipeline?: SessionPipeline;
 	statusReadiness?: "checking" | "ready" | "unavailable";
 	/**
 	 * How far this session's start-up got. A Chat spawn answers as soon as the

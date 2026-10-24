@@ -10,10 +10,12 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 )
 
 // commandTimeout bounds a mutating daemon call. Calls do real work (tmux
@@ -200,6 +202,16 @@ func (c *commandContext) doJSONPathWithHeadersAndTimeout(
 	}
 	if sideID := os.Getenv("AO_SIDE_CONVERSATION_ID"); sideID != "" {
 		req.Header.Set("X-AO-Side-Conversation", sideID)
+	}
+	// Name the calling session whenever there is one, and prove it when the
+	// token is present. The middleware only marks the caller verified or
+	// claimed; sending the id without a token is deliberate, so a session that
+	// lost its token reads as an untrusted agent rather than as a human.
+	if sessionID := strings.TrimSpace(os.Getenv("AO_SESSION_ID")); sessionID != "" {
+		req.Header.Set(sessionauth.HeaderSession, sessionID)
+		if token := strings.TrimSpace(os.Getenv(sessionauth.EnvSessionToken)); token != "" {
+			req.Header.Set(sessionauth.HeaderSessionToken, token)
+		}
 	}
 
 	// Reuse the injected client's transport (keeps it stubbable in tests) but

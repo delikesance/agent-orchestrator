@@ -27,6 +27,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 	"github.com/aoagents/agent-orchestrator/backend/internal/sessionartifacts"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 	"github.com/aoagents/agent-orchestrator/backend/internal/sessionguard"
 	"github.com/aoagents/agent-orchestrator/backend/internal/skillassets"
 	"github.com/aoagents/agent-orchestrator/backend/internal/termtheme"
@@ -63,6 +64,9 @@ var (
 	// selected harness's catalog and the harness does not accept arbitrary model
 	// ids. The API maps it to a 400.
 	ErrUnsupportedModel = errors.New("session: model is not supported by the selected harness")
+	// ErrInvalidTier means the requested worker tier is not fast, standard or
+	// deep. The API maps it to a 400.
+	ErrInvalidTier = errors.New("session: worker tier must be fast, standard or deep")
 	// ErrScratchBranchUnsupported means a caller tried to force git branch
 	// semantics onto a scratch project.
 	ErrScratchBranchUnsupported = errors.New("session: scratch projects do not support branches")
@@ -184,7 +188,11 @@ func wrapSpawnStageEarly(stage, err error) error {
 const (
 	EnvSessionID = "AO_SESSION_ID"
 	EnvProjectID = "AO_PROJECT_ID"
-	EnvIssueID   = "AO_ISSUE_ID"
+	// EnvSessionToken authenticates AO_SESSION_ID to the daemon: the CLI sends
+	// both as X-AO-Session / X-AO-Session-Token. Strict nested-spawn auth is
+	// switched on with AO_STRICT_SESSION_AUTH=1 (default off).
+	EnvSessionToken = sessionauth.EnvSessionToken
+	EnvIssueID      = "AO_ISSUE_ID"
 	// EnvRuntimeLaunchID identifies the current supervised agent generation.
 	EnvRuntimeLaunchID = "AO_RUNTIME_LAUNCH_ID"
 	// EnvSupervisedProcess tells terminal runtimes that the AO supervisor owns
@@ -325,6 +333,11 @@ type Store interface {
 	GetSessionCleanupFacts(ctx context.Context, id domain.SessionID) (domain.SessionCleanupRecord, bool, error)
 	ListSessions(ctx context.Context, project domain.ProjectID) ([]domain.SessionRecord, error)
 	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
+	// CountLiveChildSessions counts the non-terminated sessions spawned by parent.
+	CountLiveChildSessions(ctx context.Context, parent domain.SessionID) (int, error)
+	// ListChildSessions returns every session spawned by parent, ordered by
+	// number. Records are partial (identity, lifecycle and lineage facts).
+	ListChildSessions(ctx context.Context, parent domain.SessionID) ([]domain.SessionRecord, error)
 	ListChatHibernationCandidates(ctx context.Context) ([]domain.SessionID, error)
 	// DeleteSession removes a session row only if it is still in seed state
 	// (no workspace, runtime handle, agent session id, or prompt; not
@@ -370,6 +383,8 @@ type Manager struct {
 	agents    ports.AgentResolver
 	workspace ports.Workspace
 	store     Store
+	// spawnLocks serializes the spawn cap check and seed insert per project.
+	spawnLocks projectSpawnLocks
 	// agentReadiness is late-bound by SetAgentReadiness.
 	agentReadiness ports.AgentReadinessProvider
 	// messenger is a sessionguard.Guard wrapping the raw messenger, so every
@@ -400,6 +415,8 @@ type Manager struct {
 	attachmentSuffix            func() (string, error)
 	dataDir                     string
 	runFilePath                 string
+	sessionSecret               []byte
+	strictSessionAuth           bool
 	clock                       func() time.Time
 	reconcileWorkers            int
 	defaultBranchRefreshTimeout time.Duration
@@ -422,6 +439,9 @@ type Manager struct {
 	// killTeardown bounds Kill's detached teardown. Zero means
 	// killTeardownBudget; tests shrink it to prove what survives its expiry.
 	killTeardown time.Duration
+	// childNotices tracks the parent completion notices and the kill cascades
+	// that suppress them (see child_completion.go).
+	childNotices childNoticeState
 	// openTranscriptFile is os.Open in production. The narrow seam lets tests
 	// deterministically prove that a post-stop transcript read failure falls
 	// back without advertising the provider path.
@@ -770,7 +790,14 @@ type Deps struct {
 	// RunFilePath is exported to spawned agents as AO_RUN_FILE so their hook
 	// callbacks reach this daemon even when another AO daemon is also running.
 	RunFilePath string
-	Clock       func() time.Time
+	// SessionSecret keys AO_SESSION_TOKEN, the per-session proof exported next
+	// to AO_SESSION_ID (see package sessionauth). Empty exports no token.
+	SessionSecret []byte
+	// StrictSessionAuth makes a nested spawn whose worker parent is not
+	// backed by a verified caller fail with ErrInvalidParent. Daemon wiring
+	// sets it from AO_STRICT_SESSION_AUTH; default off.
+	StrictSessionAuth bool
+	Clock             func() time.Time
 	// LookPath overrides exec.LookPath for the pre-launch agent-binary check.
 	// Production wiring leaves this nil and the manager defaults to
 	// exec.LookPath; tests inject a stub so they need not seed real binaries.
@@ -833,6 +860,8 @@ func New(d Deps) *Manager {
 		attachmentSuffix:               randomSuffix,
 		dataDir:                        d.DataDir,
 		runFilePath:                    strings.TrimSpace(d.RunFilePath),
+		sessionSecret:                  d.SessionSecret,
+		strictSessionAuth:              d.StrictSessionAuth,
 		clock:                          d.Clock,
 		reconcileWorkers:               d.ReconcileWorkers,
 		defaultBranchRefreshTimeout:    defaultBranchRefreshTimeout,
@@ -907,12 +936,16 @@ func New(d Deps) *Manager {
 // parks the row as terminated and rolls back what was built.
 func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, int, int, error) {
 	phases := newSpawnPhases()
-	rec, promptBytes, systemPromptBytes, err := m.spawn(ctx, cfg, phases)
+	var tier tierOutcome
+	rec, promptBytes, systemPromptBytes, err := m.spawn(ctx, cfg, phases, &tier)
 	phases.log(m.logger, cfg.Harness, err)
+	if err == nil {
+		rec.TierApplied, rec.TierWarning = tier.Applied, tier.Warning
+	}
 	return rec, promptBytes, systemPromptBytes, err
 }
 
-func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, phases *spawnPhases) (domain.SessionRecord, int, int, error) {
+func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, phases *spawnPhases, tier *tierOutcome) (domain.SessionRecord, int, int, error) {
 	if cfg.RequestedOutput == domain.RequestedOutputArtifact && m.artifactDir("") == "" {
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", ErrArtifactOutputUnavailable)
 	}
@@ -943,12 +976,27 @@ func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, phases *spaw
 	if projectKind == domain.ProjectKindScratch && strings.TrimSpace(cfg.Branch) != "" {
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", ErrScratchBranchUnsupported)
 	}
+	// Nested-spawn guardrails (docs/plans/nested-spawn.md). The parent and the
+	// structural limits are checked here, before any durable state; the counts
+	// are checked later under the project spawn lock, right before the seed row.
+	parent, err := m.resolveSpawnParent(ctx, cfg)
+	if err != nil {
+		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
+	}
+	if err := checkSpawnLimits(cfg, parent, 0, 0); err != nil {
+		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
+	}
 	if cfg.ParentSessionID != "" && cfg.AgentConfig.Permissions == "" {
 		permissions, err := m.inheritedSpawnPermissions(ctx, cfg.ProjectID, cfg.ParentSessionID)
 		if err != nil {
 			return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
 		}
 		cfg.AgentConfig.Permissions = permissions
+	}
+	depth := spawnDepth(cfg.Kind, parent)
+	if parent == nil {
+		// A stale parent was ignored: do not persist a dangling reference.
+		cfg.ParentSessionID = ""
 	}
 	// A per-project role override picks the harness when the spawn names none,
 	// so a project can default workers to one agent and orchestrators to another.
@@ -989,6 +1037,18 @@ func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, phases *spaw
 	// model the harness cannot honor should not leave a seed row behind.
 	explicitModel := cfg.AgentConfig.Model != ""
 	agentConfig := applySpawnAgentConfig(effectiveAgentConfig(cfg.Harness, cfg.Kind, project.Config), cfg.AgentConfig)
+	// A worker tier fills only the model/effort the spawn left empty, resolved on
+	// the harness that will actually launch. The merged override then goes
+	// through the same validation and catalog checks as an explicit one.
+	if cfg.Tier != "" && !cfg.Tier.Valid() {
+		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w: %q", ErrInvalidTier, cfg.Tier)
+	}
+	override, outcome := m.applySpawnTier(ctx, cfg, agentConfig)
+	*tier = outcome
+	if outcome.Applied {
+		cfg.AgentConfig = override
+		agentConfig = applySpawnAgentConfig(effectiveAgentConfig(cfg.Harness, cfg.Kind, project.Config), cfg.AgentConfig)
+	}
 	if err := validateSpawnModel(cfg.Harness, agentConfig.Model); err != nil {
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w: %s", ErrUnsupportedModel, err.Error())
 	}
@@ -1056,6 +1116,26 @@ func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, phases *spaw
 
 	asyncChat := cfg.Async && mode == domain.SessionModeChat && m.chat != nil && (cfg.Kind == domain.KindOrchestrator || cfg.Kind == domain.KindWorker)
 
+	// The caps count live workers, so the count and the insert that raises it
+	// run under one per-project lock: held from the check through the seed row
+	// (or the promotion of a prepared row) and released before the slow
+	// workspace and launch work. Every error return releases it too.
+	unlockSpawn := func() {}
+	defer func() { unlockSpawn() }()
+	if cfg.Kind == domain.KindWorker {
+		unlockSpawn = m.spawnLocks.Lock(cfg.ProjectID)
+		// An idempotent retry must get its existing session back, never a cap
+		// error: a prior request already counts in the totals it would trip.
+		// Only a genuinely new spawn reaches the caps.
+		if replay, found, err := m.replayExistingSpawn(ctx, cfg); err != nil {
+			return domain.SessionRecord{}, 0, 0, err
+		} else if found {
+			return replay.rec, 0, 0, replay.err
+		}
+		if err := m.enforceSpawnCaps(ctx, cfg, parent); err != nil {
+			return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
+		}
+	}
 	var prep *taskPreparation
 	if cfg.AutomationRunID == nil && cfg.Branch == "" {
 		prep = m.claimTaskPreparation(cfg.TaskPreparation, cfg.ProjectID)
@@ -1064,7 +1144,7 @@ func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, phases *spaw
 	if prep != nil {
 		rec = prep.record
 	} else {
-		seed := seedRecord(cfg, project.Config, m.clock())
+		seed := seedRecord(cfg, project.Config, m.clock(), depth)
 		if mode == domain.SessionModeChat {
 			seed.Metadata.Model = cfg.AgentConfig.Model
 			seed.Metadata.Effort = cfg.AgentConfig.Effort
@@ -1080,18 +1160,13 @@ func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, phases *spaw
 			var fresh bool
 			rec, fresh, err = m.store.CreateAutomationSession(ctx, seed)
 			if err == nil && !fresh {
-				if rec.AutomationLaunchCompleted {
-					// The prior launch already built and delivered a prompt;
-					// this call built none, since prompt construction happens
-					// further down (it needs the session id for the artifact
-					// directory path) and this branch returns before reaching it.
-					return rec, 0, 0, nil
-				}
-				return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: automation session %s has an incomplete prior launch", rec.ID)
+				replay := replayAutomationSession(rec)
+				return replay.rec, 0, 0, replay.err
 			}
 		} else {
 			rec, err = m.store.CreateSession(ctx, seed)
 		}
+		unlockSpawn()
 		if err != nil {
 			return domain.SessionRecord{}, 0, 0, wrapSpawnStageEarly(ErrSpawnCreate, err)
 		}
@@ -1163,7 +1238,7 @@ func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, phases *spaw
 				return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrWorkspaceCreate, err)
 			}
 		}
-		seed := seedRecord(cfg, project.Config, m.clock())
+		seed := seedRecord(cfg, project.Config, m.clock(), depth)
 		seed.ID = id
 		seed.Metadata.ArtifactDir = artifactDir
 		if mode == domain.SessionModeChat {
@@ -1174,6 +1249,7 @@ func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, phases *spaw
 			seed.ProvisionState = domain.SessionProvisionProvisioning
 		}
 		rec, err = m.promoteTaskPreparation(ctx, prep, seed)
+		unlockSpawn()
 		if err != nil {
 			cleanupCtx, cancel := spawnRollbackContext(ctx)
 			m.discardClaimedTaskPreparation(cleanupCtx, prep)
@@ -1467,6 +1543,7 @@ func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, phases *spaw
 	phases.mark("runtime_create")
 	metadata := domain.SessionMetadata{
 		Permissions:               rec.Metadata.Permissions,
+		Tier:                      rec.Metadata.Tier,
 		Branch:                    ws.Branch,
 		WorkspacePath:             ws.Path,
 		WorkspaceRepoPath:         ws.RepoPath,
@@ -1547,6 +1624,58 @@ func (m *Manager) markAutomationLaunchCompleted(ctx context.Context, id domain.S
 	rec.AutomationLaunchCompleted = true
 	rec.UpdatedAt = m.clock()
 	return m.store.UpdateSession(ctx, rec)
+}
+
+// spawnReplay is the outcome of an idempotent spawn retry.
+type spawnReplay struct {
+	rec domain.SessionRecord
+	err error
+}
+
+// replayAutomationSession is the result for an automation run that already has
+// a session.
+func replayAutomationSession(rec domain.SessionRecord) spawnReplay {
+	if rec.AutomationLaunchCompleted {
+		// The prior launch already built and delivered a prompt; this call built
+		// none, since prompt construction happens further down (it needs the
+		// session id for the artifact directory path) and the replay returns
+		// before reaching it.
+		return spawnReplay{rec: rec}
+	}
+	return spawnReplay{err: fmt.Errorf("spawn: automation session %s has an incomplete prior launch", rec.ID)}
+}
+
+// automationSessionLookup is the optional read the spawn replay uses to find a
+// run's existing session without creating one. The production store has it; a
+// store without it falls back to the replay inside CreateAutomationSession.
+type automationSessionLookup interface {
+	GetSessionByAutomationRunID(ctx context.Context, id domain.AutomationRunID) (domain.SessionRecord, bool, error)
+}
+
+// replayExistingSpawn finds the session an idempotent retry (same client
+// request id or same automation run) already created, so it can be returned
+// before any cap check. found is false for a genuinely new spawn.
+func (m *Manager) replayExistingSpawn(ctx context.Context, cfg ports.SpawnConfig) (spawnReplay, bool, error) {
+	switch {
+	case cfg.ClientRequestID != "":
+		existing, found, err := m.store.GetSessionByClientRequestID(ctx, cfg.ClientRequestID)
+		if err != nil || !found {
+			return spawnReplay{}, false, err
+		}
+		rec, replayErr := replayClientRequest(existing, cfg.ClientRequestHash)
+		return spawnReplay{rec: rec, err: replayErr}, true, nil
+	case cfg.AutomationRunID != nil:
+		lookup, ok := m.store.(automationSessionLookup)
+		if !ok {
+			return spawnReplay{}, false, nil
+		}
+		existing, found, err := lookup.GetSessionByAutomationRunID(ctx, *cfg.AutomationRunID)
+		if err != nil || !found {
+			return spawnReplay{}, false, err
+		}
+		return replayAutomationSession(existing), true, nil
+	}
+	return spawnReplay{}, false, nil
 }
 
 func replayClientRequest(rec domain.SessionRecord, hash string) (domain.SessionRecord, error) {
@@ -2377,7 +2506,8 @@ func sessionPrefix(project domain.ProjectRecord) string {
 // row when nothing observable has landed yet (seed state) via rollbackSpawn or
 // rollbackSpawnSeedRow.
 func (m *Manager) markSpawnFailedTerminated(ctx context.Context, id domain.SessionID) {
-	_ = m.lcm.MarkTerminated(ctx, id)
+	// A child that never started has nothing to report to its parent.
+	_ = m.lcm.MarkTerminated(withLifecycleFlags(ctx, flagNoNotice), id)
 	m.cleanupSystemPromptDir(id)
 }
 
@@ -2511,6 +2641,9 @@ func (m *Manager) recordTermination(ctx context.Context, id domain.SessionID, dr
 type KillResult struct {
 	Freed          bool
 	CleanupPending bool
+	// ChildrenKilled lists the live descendants terminated by the cascade, in
+	// kill order (deepest first). Empty when the session had none.
+	ChildrenKilled []domain.SessionID `json:"childrenKilled,omitempty"`
 }
 
 // Kill waits for workspace retirement for internal callers that depend on it.
@@ -2525,7 +2658,125 @@ func (m *Manager) RequestKill(ctx context.Context, id domain.SessionID) (KillRes
 	return m.kill(ctx, id, true)
 }
 
+// maxKillCascadeSessions caps how many descendants one cascade visits. The
+// spawn depth and fan-out limits keep real trees far below it; it only stops a
+// corrupted (cyclic or runaway) lineage from looping the cascade.
+const maxKillCascadeSessions = 256
+
+// KillChildren terminates every live descendant of parent, deepest first, and
+// leaves parent itself alone. It returns the ids it killed, in kill order. A
+// descendant that fails to die does not stop the others; failures come back
+// joined. The reaper calls it when a parent agent exits on its own.
+func (m *Manager) KillChildren(ctx context.Context, parent domain.SessionID) ([]domain.SessionID, error) {
+	return m.killChildren(ctx, parent, true)
+}
+
+// killChildren only cascades for a WORKER parent (a worker with nested
+// children). An orchestrator's workers are deliberately not killed by its
+// termination: daemon shutdown, replacement and a reaper-observed orchestrator
+// death all terminate orchestrators while their workers must survive (and keep
+// their restore markers).
+func (m *Manager) killChildren(ctx context.Context, parent domain.SessionID, backgroundCleanup bool) ([]domain.SessionID, error) {
+	rec, ok, err := m.store.GetSession(ctx, parent)
+	if err != nil {
+		return nil, fmt.Errorf("kill %s: load session for child cascade: %w", parent, err)
+	}
+	if !ok || rec.Kind != domain.KindWorker {
+		return nil, nil
+	}
+	budget := m.killTeardown
+	if budget <= 0 {
+		budget = killTeardownBudget
+	}
+	// One budget bounds when the cascade may START another kill; each kill is
+	// itself bounded by its own teardown budget. Detached from the caller's
+	// cancellation for the same reason kill is. Listing children uses a context
+	// that outlives the budget: an expired budget must only stop new kills, never
+	// make a survivor invisible.
+	listCtx := context.WithoutCancel(ctx)
+	cascadeCtx, cancel := context.WithTimeout(listCtx, budget)
+	defer cancel()
+	visited := map[domain.SessionID]bool{parent: true}
+	// Every session the cascade covers is marked so a child ending under a
+	// still-live cascading parent does not send it a completion notice.
+	m.childNotices.markCascading(parent)
+	defer func() {
+		for id := range visited {
+			m.childNotices.unmarkCascading(id)
+		}
+	}()
+	var killed, survivors []domain.SessionID
+	var errs []error
+	m.killDescendants(ctx, listCtx, cascadeCtx, parent, backgroundCleanup, visited, &killed, &survivors, &errs)
+	if len(survivors) > 0 {
+		ids := make([]string, len(survivors))
+		for i, id := range survivors {
+			ids[i] = string(id)
+		}
+		list := strings.Join(ids, ", ")
+		m.logger.Warn("kill cascade left live descendants", "sessionID", parent, "survivors", ids)
+		errs = append(errs, fmt.Errorf("kill %s: %d live descendants survive the cascade: %s", parent, len(survivors), list))
+	}
+	return killed, errors.Join(errs...)
+}
+
+// killDescendants walks parent's children depth-first: a child's own
+// descendants die before the child. Terminated children are not killed again
+// but are still descended into so a live grandchild is never orphaned. Live
+// children whose kill failed or was skipped land in survivors.
+func (m *Manager) killDescendants(ctx, listCtx, cascadeCtx context.Context, parent domain.SessionID, backgroundCleanup bool, visited map[domain.SessionID]bool, killed, survivors *[]domain.SessionID, errs *[]error) {
+	children, err := m.store.ListChildSessions(listCtx, parent)
+	if err != nil {
+		*errs = append(*errs, fmt.Errorf("kill %s: list children: %w", parent, err))
+		return
+	}
+	for _, child := range children {
+		if visited[child.ID] {
+			continue // cycle guard
+		}
+		if len(visited) >= maxKillCascadeSessions {
+			*errs = append(*errs, fmt.Errorf("kill %s: cascade limit of %d sessions reached", parent, maxKillCascadeSessions))
+			return
+		}
+		visited[child.ID] = true
+		m.childNotices.markCascading(child.ID)
+		m.killDescendants(ctx, listCtx, cascadeCtx, child.ID, backgroundCleanup, visited, killed, survivors, errs)
+		if child.IsTerminated {
+			continue
+		}
+		if err := cascadeCtx.Err(); err != nil {
+			*errs = append(*errs, fmt.Errorf("kill %s: cascade budget exhausted: %w", child.ID, err))
+			*survivors = append(*survivors, child.ID)
+			continue
+		}
+		if _, err := m.killOne(ctx, child.ID, backgroundCleanup); err != nil {
+			*errs = append(*errs, err)
+			*survivors = append(*survivors, child.ID)
+			continue
+		}
+		*killed = append(*killed, child.ID)
+	}
+}
+
+// kill terminates id after its live descendants (cascade is always on; there
+// is no keep-children flag). Failure policy: a descendant that cannot be killed
+// is reported but never keeps id alive, so the parent is always attempted. The
+// returned error joins the descendant failures with the parent's own.
 func (m *Manager) kill(ctx context.Context, id domain.SessionID, backgroundCleanup bool) (KillResult, error) {
+	// id is marked for the whole kill (not only the descendants' part) so no
+	// child notice reaches it before it is itself terminated.
+	m.childNotices.markCascading(id)
+	defer m.childNotices.unmarkCascading(id)
+	childrenKilled, childErr := m.killChildren(ctx, id, backgroundCleanup)
+	result, err := m.killOne(ctx, id, backgroundCleanup)
+	result.ChildrenKilled = childrenKilled
+	if childErr != nil {
+		err = errors.Join(childErr, err)
+	}
+	return result, err
+}
+
+func (m *Manager) killOne(ctx context.Context, id domain.SessionID, backgroundCleanup bool) (KillResult, error) {
 	// Teardown deliberately stops riding the caller's context. Kill runs a
 	// sequence (stop the agent, tear the controller down, mark the row
 	// terminated, drop the worktree) where being cancelled partway leaves a session
@@ -2720,6 +2971,8 @@ func (m *Manager) kill(ctx context.Context, id domain.SessionID, backgroundClean
 // This deliberately does not write a session_worktrees row: those rows are
 // boot-restore markers, and a replaced orchestrator must stay terminated.
 func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID) error {
+	// Replacement is not a kill: no child cascade and no completion notice.
+	ctx = withLifecycleFlags(ctx, flagNoCascade|flagNoNotice)
 	if err := m.beginAgentOperation(ctx, id, agentOperationRetire); err != nil {
 		if errors.Is(err, errAgentOperationInProgress) {
 			err = ErrOperationInProgress
@@ -3682,6 +3935,7 @@ func (m *Manager) relaunchSessionWithPolicyAndGeneration(ctx context.Context, op
 	}
 	metadata := domain.SessionMetadata{
 		Permissions:               rec.Metadata.Permissions,
+		Tier:                      rec.Metadata.Tier,
 		Branch:                    ws.Branch,
 		WorkspacePath:             ws.Path,
 		WorkspaceRepoPath:         ws.RepoPath,
@@ -3802,6 +4056,12 @@ func (m *Manager) PersistChatModel(ctx context.Context, id domain.SessionID, mod
 // Failures on individual sessions are logged and do not abort the loop.
 // ForceDestroy is never called if capture or the DB write did not succeed.
 func (m *Manager) SaveAndTeardownAll(ctx context.Context) error {
+	// Shutdown saves every session itself, in list order, so a worker parent
+	// terminated before its children must not cascade onto them: the cascade
+	// would drop their restore markers and destroy their worktrees. The flag
+	// also silences the completion notices to parents that are about to be
+	// torn down. See lifecycleFlags.
+	ctx = withLifecycleFlags(ctx, flagNoCascade|flagNoNotice)
 	recs, err := m.store.ListAllSessions(ctx)
 	if err != nil {
 		return fmt.Errorf("save-teardown-all: list sessions: %w", err)
@@ -5591,8 +5851,14 @@ func normalizeWorkspacePath(p string) string {
 
 // ---- helpers ----
 
-func seedRecord(cfg ports.SpawnConfig, projectConfig domain.ProjectConfig, now time.Time) domain.SessionRecord {
+// seedRecord builds the row a spawn inserts. depth is the validated spawn depth
+// (spawnDepth); the parent link comes from cfg.ParentSessionID, which spawn
+// clears when the parent was ignored, and the tier is the requested tier name.
+func seedRecord(cfg ports.SpawnConfig, projectConfig domain.ProjectConfig, now time.Time, depth int) domain.SessionRecord {
 	return domain.SessionRecord{
+		PipelineStage:     seedPipelineStage(cfg, projectConfig),
+		ParentSessionID:   cfg.ParentSessionID,
+		Depth:             depth,
 		ProjectID:         cfg.ProjectID,
 		IssueID:           cfg.IssueID,
 		AutomationRunID:   cfg.AutomationRunID,
@@ -5607,13 +5873,32 @@ func seedRecord(cfg ports.SpawnConfig, projectConfig domain.ProjectConfig, now t
 		// Resolved before this point and persisted here. There is no UPDATE
 		// statement that can change it afterwards.
 		Mode:              domain.NormalizeSessionMode(cfg.RequestedMode),
-		Metadata:          domain.SessionMetadata{Permissions: applySpawnAgentConfig(effectiveAgentConfig(cfg.Harness, cfg.Kind, projectConfig), cfg.AgentConfig).Permissions},
+		Metadata: domain.SessionMetadata{
+			Permissions: applySpawnAgentConfig(effectiveAgentConfig(cfg.Harness, cfg.Kind, projectConfig), cfg.AgentConfig).Permissions,
+			Tier:        string(cfg.Tier),
+		},
 		RequestedOutput:   cfg.RequestedOutput,
 		OutputType:        domain.SessionOutputNone,
 		AutoReviewEnabled: projectConfig.AutoReview,
 		AutoInjectReview:  true,
 		AutoInjectCI:      true,
 	}
+}
+
+// seedPipelineStage enrolls a worker an orchestrator (or a parent worker)
+// spawned in the mandatory delivery pipeline: it starts at building, attempt 0,
+// when the project's resolved pipeline is enabled. spawn clears
+// cfg.ParentSessionID when the parent was ignored, so a non-empty value here
+// means a live parent. Standalone user sessions and chat sessions keep the
+// legacy empty stage.
+func seedPipelineStage(cfg ports.SpawnConfig, projectConfig domain.ProjectConfig) domain.PipelineStage {
+	if cfg.Kind != domain.KindWorker || cfg.ParentSessionID == "" || domain.NormalizeSessionMode(cfg.RequestedMode) == domain.SessionModeChat {
+		return domain.PipelineStageNone
+	}
+	if !projectConfig.ResolvedPipeline().IsEnabled(true) {
+		return domain.PipelineStageNone
+	}
+	return domain.PipelineStageBuilding
 }
 
 func defaultSessionBranch(id domain.SessionID, kind domain.SessionKind, prefix, branchNamespace string) string {
@@ -5844,6 +6129,11 @@ func (m *Manager) buildSystemPrompt(ctx context.Context, kind domain.SessionKind
 	case domain.KindOrchestrator:
 		cfg.OrchestratorRules = project.Config.OrchestratorRules
 	case domain.KindWorker:
+		// The row's depth lets the prompt hide the child-spawn section at the
+		// depth cap; a missing row leaves it 0 (unknown).
+		if rec, ok, err := m.store.GetSession(ctx, sessionID); err == nil && ok {
+			cfg.Depth = rec.Depth
+		}
 		if projectID != "" {
 			orchestratorID, ok, err := m.activeOrchestratorSessionID(ctx, projectID)
 			if err != nil {
@@ -6160,6 +6450,15 @@ func (m *Manager) runtimeEnvChecked(id domain.SessionID, project domain.ProjectI
 	if runFilePath != "" {
 		env[EnvRunFile] = runFilePath
 	}
+	// The token proves AO_SESSION_ID to the daemon; it is set last-wins here so a
+	// project cannot supply its own, and dropped when no secret is configured.
+	deleteProtectedEnv(env, EnvSessionToken, caseInsensitive)
+	if token := sessionauth.Issue(m.sessionSecret, string(id)); token != "" {
+		env[EnvSessionToken] = token
+	}
+	// The review token is the reviewer's proof alone: a worker holding it could
+	// submit its own verdict. Neither the project nor the spawn may supply one.
+	deleteProtectedEnv(env, sessionauth.EnvReviewToken, caseInsensitive)
 	setProtectedEnv(env, EnvBrowserCapability, "", caseInsensitive)
 	setProtectedEnv(env, EnvBrowserRuntimeToken, "", caseInsensitive)
 	setProtectedEnv(env, EnvBrowserRuntimeTokenStdin, "", caseInsensitive)

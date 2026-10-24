@@ -570,6 +570,18 @@ type PRURLAlias struct {
 	CanonicalURL string
 }
 
+type PipelineGate struct {
+	ID          string
+	SessionID   string
+	Stage       string
+	Attempt     int64
+	Result      string
+	HeadSha     string
+	Evidence    string
+	ReviewRunID string
+	CreatedAt   time.Time
+}
+
 type Project struct {
 	ID            domain.ProjectID
 	Path          string
@@ -731,6 +743,11 @@ type Session struct {
 	LaunchOptions                    string
 	BranchNaming                     bool
 	TemporaryBranch                  string
+	ParentSessionID                  string
+	SpawnDepth                       int64
+	Tier                             string
+	PipelineStage                    string
+	PipelineAttempt                  int64
 }
 
 type SessionAgentAccount struct {

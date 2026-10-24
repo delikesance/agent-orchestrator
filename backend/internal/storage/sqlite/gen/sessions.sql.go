@@ -154,6 +154,27 @@ func (q *Queries) CommitSessionControllerEpoch(ctx context.Context, arg CommitSe
 	return result.RowsAffected()
 }
 
+const countLiveChildSessions = `-- name: CountLiveChildSessions :one
+
+SELECT COUNT(*) FROM sessions
+WHERE parent_session_id = ? AND is_terminated = 0
+`
+
+// NOTE: the `DELETE FROM sessions WHERE id = ? AND <seed-state predicates>`
+// statement is intentionally NOT a sqlc query - same sqlc 1.31 SQLite-parser
+// bug as documented in queries/changelog.sql: trailing string literals (and
+// placeholders) on the RHS of `=` in a DELETE get silently stripped, so the
+// generated SQL ends up mid-clause and the row count is meaningless. The
+// store runs that DELETE directly via tx.ExecContext inside
+// Store.DeleteSession, inside the same transaction as the SessionIsSeed
+// probe and the raw change_log cleanup.
+func (q *Queries) CountLiveChildSessions(ctx context.Context, parentSessionID string) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countLiveChildSessions, parentSessionID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countStaleBinarySessions = `-- name: CountStaleBinarySessions :many
 SELECT harness, COUNT(*) AS sessions FROM sessions
 WHERE is_terminated = 0 AND hibernated_at IS NULL AND activity_state <> 'exited'
@@ -227,7 +248,8 @@ SELECT id, project_id, num, issue_id, kind, harness,
     claude_activity_facts, codex_activity_facts,
     hibernated_at, stale_binary_since, stale_binary_version, stale_binary_launch, stale_binary_switch_failed_at,
     client_request_id, client_request_hash, client_request_committed,
-    runtime_released_launch_id
+    runtime_released_launch_id, parent_session_id, spawn_depth, tier,
+    pipeline_stage, pipeline_attempt
 FROM sessions WHERE id = ?
 `
 
@@ -310,6 +332,11 @@ type GetSessionRow struct {
 	ClientRequestHash                string
 	ClientRequestCommitted           bool
 	RuntimeReleasedLaunchID          string
+	ParentSessionID                  string
+	SpawnDepth                       int64
+	Tier                             string
+	PipelineStage                    string
+	PipelineAttempt                  int64
 }
 
 func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (GetSessionRow, error) {
@@ -394,6 +421,11 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (GetSessi
 		&i.ClientRequestHash,
 		&i.ClientRequestCommitted,
 		&i.RuntimeReleasedLaunchID,
+		&i.ParentSessionID,
+		&i.SpawnDepth,
+		&i.Tier,
+		&i.PipelineStage,
+		&i.PipelineAttempt,
 	)
 	return i, err
 }
@@ -417,7 +449,8 @@ SELECT id, project_id, num, issue_id, kind, harness,
     claude_activity_facts, codex_activity_facts,
     hibernated_at, stale_binary_since, stale_binary_version, stale_binary_launch, stale_binary_switch_failed_at,
     client_request_id, client_request_hash, client_request_committed,
-    runtime_released_launch_id
+    runtime_released_launch_id, parent_session_id, spawn_depth, tier,
+    pipeline_stage, pipeline_attempt
 FROM sessions WHERE automation_run_id = ?
 `
 
@@ -500,6 +533,11 @@ type GetSessionByAutomationRunIDRow struct {
 	ClientRequestHash                string
 	ClientRequestCommitted           bool
 	RuntimeReleasedLaunchID          string
+	ParentSessionID                  string
+	SpawnDepth                       int64
+	Tier                             string
+	PipelineStage                    string
+	PipelineAttempt                  int64
 }
 
 func (q *Queries) GetSessionByAutomationRunID(ctx context.Context, automationRunID *domain.AutomationRunID) (GetSessionByAutomationRunIDRow, error) {
@@ -584,6 +622,11 @@ func (q *Queries) GetSessionByAutomationRunID(ctx context.Context, automationRun
 		&i.ClientRequestHash,
 		&i.ClientRequestCommitted,
 		&i.RuntimeReleasedLaunchID,
+		&i.ParentSessionID,
+		&i.SpawnDepth,
+		&i.Tier,
+		&i.PipelineStage,
+		&i.PipelineAttempt,
 	)
 	return i, err
 }
@@ -604,7 +647,8 @@ INSERT INTO sessions (
     requested_output,
     created_at, updated_at, is_pinned, pinned_at, auto_inject_review, auto_inject_ci,
     provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed,
-    client_request_id, client_request_hash
+    client_request_id, client_request_hash, parent_session_id, spawn_depth, tier,
+    pipeline_stage, pipeline_attempt
 ) VALUES (
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
@@ -612,7 +656,7 @@ INSERT INTO sessions (
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-    ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?
 )
 `
 
@@ -680,6 +724,11 @@ type InsertSessionParams struct {
 	AutomationLaunchCompleted        bool
 	ClientRequestID                  string
 	ClientRequestHash                string
+	ParentSessionID                  string
+	SpawnDepth                       int64
+	Tier                             string
+	PipelineStage                    string
+	PipelineAttempt                  int64
 }
 
 func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) error {
@@ -747,6 +796,11 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) er
 		arg.AutomationLaunchCompleted,
 		arg.ClientRequestID,
 		arg.ClientRequestHash,
+		arg.ParentSessionID,
+		arg.SpawnDepth,
+		arg.Tier,
+		arg.PipelineStage,
+		arg.PipelineAttempt,
 	)
 	return err
 }
@@ -770,7 +824,8 @@ SELECT id, project_id, num, issue_id, kind, harness,
     claude_activity_facts, codex_activity_facts,
     hibernated_at, stale_binary_since, stale_binary_version, stale_binary_launch, stale_binary_switch_failed_at,
     client_request_id, client_request_hash, client_request_committed,
-    runtime_released_launch_id
+    runtime_released_launch_id, parent_session_id, spawn_depth, tier,
+    pipeline_stage, pipeline_attempt
 FROM sessions ORDER BY project_id, num
 `
 
@@ -853,6 +908,11 @@ type ListAllSessionsRow struct {
 	ClientRequestHash                string
 	ClientRequestCommitted           bool
 	RuntimeReleasedLaunchID          string
+	ParentSessionID                  string
+	SpawnDepth                       int64
+	Tier                             string
+	PipelineStage                    string
+	PipelineAttempt                  int64
 }
 
 func (q *Queries) ListAllSessions(ctx context.Context) ([]ListAllSessionsRow, error) {
@@ -943,6 +1003,11 @@ func (q *Queries) ListAllSessions(ctx context.Context) ([]ListAllSessionsRow, er
 			&i.ClientRequestHash,
 			&i.ClientRequestCommitted,
 			&i.RuntimeReleasedLaunchID,
+			&i.ParentSessionID,
+			&i.SpawnDepth,
+			&i.Tier,
+			&i.PipelineStage,
+			&i.PipelineAttempt,
 		); err != nil {
 			return nil, err
 		}
@@ -990,6 +1055,101 @@ func (q *Queries) ListChatHibernationCandidates(ctx context.Context) ([]domain.S
 	return items, nil
 }
 
+const listChildSessions = `-- name: ListChildSessions :many
+SELECT id, project_id, num, issue_id, kind, harness,
+    activity_state, activity_last_at, is_terminated, branch, workspace_path,
+    runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
+    created_at, updated_at, revision, display_name, first_signal_at, preview_url,
+    client_request_id, client_request_hash, client_request_committed,
+    runtime_released_launch_id, parent_session_id, spawn_depth, tier
+FROM sessions WHERE parent_session_id = ? ORDER BY num
+`
+
+type ListChildSessionsRow struct {
+	ID                       domain.SessionID
+	ProjectID                *domain.ProjectID
+	Num                      int64
+	IssueID                  domain.IssueID
+	Kind                     domain.SessionKind
+	Harness                  domain.AgentHarness
+	ActivityState            domain.ActivityState
+	ActivityLastAt           time.Time
+	IsTerminated             bool
+	Branch                   string
+	WorkspacePath            string
+	RuntimeHandleID          string
+	AgentSessionID           string
+	AgentSessionIDLaunchID   string
+	NativeIdentityObservedAt sql.NullTime
+	Prompt                   string
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
+	Revision                 int64
+	DisplayName              string
+	FirstSignalAt            sql.NullTime
+	PreviewURL               string
+	ClientRequestID          string
+	ClientRequestHash        string
+	ClientRequestCommitted   bool
+	RuntimeReleasedLaunchID  string
+	ParentSessionID          string
+	SpawnDepth               int64
+	Tier                     string
+}
+
+func (q *Queries) ListChildSessions(ctx context.Context, parentSessionID string) ([]ListChildSessionsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listChildSessions, parentSessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListChildSessionsRow{}
+	for rows.Next() {
+		var i ListChildSessionsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.ProjectID,
+			&i.Num,
+			&i.IssueID,
+			&i.Kind,
+			&i.Harness,
+			&i.ActivityState,
+			&i.ActivityLastAt,
+			&i.IsTerminated,
+			&i.Branch,
+			&i.WorkspacePath,
+			&i.RuntimeHandleID,
+			&i.AgentSessionID,
+			&i.AgentSessionIDLaunchID,
+			&i.NativeIdentityObservedAt,
+			&i.Prompt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Revision,
+			&i.DisplayName,
+			&i.FirstSignalAt,
+			&i.PreviewURL,
+			&i.ClientRequestID,
+			&i.ClientRequestHash,
+			&i.ClientRequestCommitted,
+			&i.RuntimeReleasedLaunchID,
+			&i.ParentSessionID,
+			&i.SpawnDepth,
+			&i.Tier,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSessionsByProject = `-- name: ListSessionsByProject :many
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
@@ -1009,7 +1169,8 @@ SELECT id, project_id, num, issue_id, kind, harness,
     claude_activity_facts, codex_activity_facts,
     hibernated_at, stale_binary_since, stale_binary_version, stale_binary_launch, stale_binary_switch_failed_at,
     client_request_id, client_request_hash, client_request_committed,
-    runtime_released_launch_id
+    runtime_released_launch_id, parent_session_id, spawn_depth, tier,
+    pipeline_stage, pipeline_attempt
 FROM sessions WHERE project_id IS ? ORDER BY num
 `
 
@@ -1092,6 +1253,11 @@ type ListSessionsByProjectRow struct {
 	ClientRequestHash                string
 	ClientRequestCommitted           bool
 	RuntimeReleasedLaunchID          string
+	ParentSessionID                  string
+	SpawnDepth                       int64
+	Tier                             string
+	PipelineStage                    string
+	PipelineAttempt                  int64
 }
 
 func (q *Queries) ListSessionsByProject(ctx context.Context, projectID *domain.ProjectID) ([]ListSessionsByProjectRow, error) {
@@ -1182,6 +1348,11 @@ func (q *Queries) ListSessionsByProject(ctx context.Context, projectID *domain.P
 			&i.ClientRequestHash,
 			&i.ClientRequestCommitted,
 			&i.RuntimeReleasedLaunchID,
+			&i.ParentSessionID,
+			&i.SpawnDepth,
+			&i.Tier,
+			&i.PipelineStage,
+			&i.PipelineAttempt,
 		); err != nil {
 			return nil, err
 		}
@@ -1397,8 +1568,13 @@ UPDATE sessions SET
     provision_error = '',
     client_request_id = ?18,
     client_request_hash = ?19,
+    parent_session_id = ?20,
+    spawn_depth = ?21,
+    tier = ?22,
+    pipeline_stage = ?23,
+    pipeline_attempt = ?24,
     is_task_preparation = 0
-WHERE id = ?20 AND is_task_preparation = 1
+WHERE id = ?25 AND is_task_preparation = 1
 `
 
 type PromoteTaskPreparationParams struct {
@@ -1421,6 +1597,11 @@ type PromoteTaskPreparationParams struct {
 	ProvisionState     domain.SessionProvisionState
 	ClientRequestID    string
 	ClientRequestHash  string
+	ParentSessionID    string
+	SpawnDepth         int64
+	Tier               string
+	PipelineStage      string
+	PipelineAttempt    int64
 	ID                 domain.SessionID
 }
 
@@ -1447,6 +1628,11 @@ func (q *Queries) PromoteTaskPreparation(ctx context.Context, arg PromoteTaskPre
 		arg.ProvisionState,
 		arg.ClientRequestID,
 		arg.ClientRequestHash,
+		arg.ParentSessionID,
+		arg.SpawnDepth,
+		arg.Tier,
+		arg.PipelineStage,
+		arg.PipelineAttempt,
 		arg.ID,
 	)
 	if err != nil {

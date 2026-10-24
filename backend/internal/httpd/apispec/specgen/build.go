@@ -310,20 +310,27 @@ var schemaNames = map[string]string{ //nolint:gosec // Public OpenAPI type names
 	// observe/ownership
 	"OwnershipOwner": "ReportingOwner",
 	// domain
-	"DomainProjectID":                 "ProjectID",
-	"DomainSessionID":                 "SessionID",
-	"DomainIssueID":                   "IssueID",
-	"DomainSession":                   "Session",
-	"DomainSessionProvisionStep":      "SessionProvisionStep",
-	"DomainSessionBranchState":        "SessionBranchState",
-	"DomainSessionStaleBinary":        "SessionStaleBinary",
-	"DomainSessionWait":               "SessionWait",
-	"DomainProjectConfig":             "ProjectConfig",
-	"DomainTrackerIntakeConfig":       "TrackerIntakeConfig",
-	"ControllersTriggerReviewRequest": "TriggerReviewRequest",
-	"DomainContainerReapConfig":       "ContainerReapConfig",
-	"DomainAgentConfig":               "AgentConfig",
-	"DomainRoleOverride":              "RoleOverride",
+	"DomainProjectID":                    "ProjectID",
+	"DomainSessionID":                    "SessionID",
+	"DomainIssueID":                      "IssueID",
+	"DomainSession":                      "Session",
+	"DomainSessionProvisionStep":         "SessionProvisionStep",
+	"DomainSessionBranchState":           "SessionBranchState",
+	"DomainSessionStaleBinary":           "SessionStaleBinary",
+	"DomainSessionWait":                  "SessionWait",
+	"DomainPipelineConfig":               "PipelineConfig",
+	"DomainProjectConfig":                "ProjectConfig",
+	"DomainTrackerIntakeConfig":          "TrackerIntakeConfig",
+	"ControllersTriggerReviewRequest":    "TriggerReviewRequest",
+	"ControllersSessionPipelineView":     "SessionPipeline",
+	"ControllersSessionPipelineGate":     "SessionPipelineGate",
+	"ControllersPipelineGateDetail":      "PipelineGateDetail",
+	"ControllersPipelineStatusResponse":  "PipelineStatusResponse",
+	"ControllersPipelineActionResponse":  "PipelineActionResponse",
+	"ControllersPipelineOverrideRequest": "PipelineOverrideRequest",
+	"DomainContainerReapConfig":          "ContainerReapConfig",
+	"DomainAgentConfig":                  "AgentConfig",
+	"DomainRoleOverride":                 "RoleOverride",
 	// httpd/controllers (wire envelopes)
 	"ControllersListProjectsResponse":                     "ListProjectsResponse",
 	"ControllersProjectResponse":                          "ProjectResponse",
@@ -732,6 +739,7 @@ func operations() []operation {
 	ops = append(ops, automationOperations()...)
 	ops = append(ops, prOperations()...)
 	ops = append(ops, reviewOperations()...)
+	ops = append(ops, pipelineOperations()...)
 	ops = append(ops, notificationOperations()...)
 	ops = append(ops, reportOperations()...)
 	ops = append(ops, usageOperations()...)
@@ -2462,6 +2470,47 @@ func pushOperations() []operation {
 	}
 }
 
+func pipelineOperations() []operation {
+	return []operation{
+		{
+			method: http.MethodGet, path: "/api/v1/sessions/{sessionId}/pipeline", id: "getSessionPipeline", tag: "sessions",
+			summary:    "Get a session's delivery pipeline status with full gate evidence",
+			pathParams: []any{controllers.SessionIDParam{}},
+			resps: []respUnit{
+				{http.StatusOK, controllers.PipelineStatusResponse{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/pipeline/retry", id: "retrySessionPipeline", tag: "sessions",
+			summary:    "Retry an escalated session's pipeline (orchestrator of the project or a person)",
+			pathParams: []any{controllers.SessionIDParam{}},
+			resps: []respUnit{
+				{http.StatusOK, controllers.PipelineActionResponse{}},
+				{http.StatusForbidden, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/pipeline/override", id: "overrideSessionPipeline", tag: "sessions",
+			summary:    "Override an escalated session's pipeline to ready (a person only)",
+			pathParams: []any{controllers.SessionIDParam{}},
+			reqBody:    controllers.PipelineOverrideRequest{},
+			resps: []respUnit{
+				{http.StatusOK, controllers.PipelineActionResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusForbidden, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+	}
+}
+
 func reviewOperations() []operation {
 	return []operation{
 		{
@@ -2767,6 +2816,7 @@ func sessionOperations() []operation {
 				{http.StatusCreated, controllers.SpawnSessionResponse{}},
 				{http.StatusBadRequest, envelope.APIError{}},
 				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},
 			},
 		},

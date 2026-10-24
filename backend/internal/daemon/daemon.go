@@ -70,12 +70,14 @@ import (
 	notificationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/notification"
 	prsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/pr"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
+	"github.com/aoagents/agent-orchestrator/backend/internal/service/pipeline"
 	reportsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/report"
 	settingssvc "github.com/aoagents/agent-orchestrator/backend/internal/service/settings"
 	"github.com/aoagents/agent-orchestrator/backend/internal/service/systemcheck"
 	"github.com/aoagents/agent-orchestrator/backend/internal/service/systeminstall"
 	usagesvc "github.com/aoagents/agent-orchestrator/backend/internal/service/usage"
 	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 	"github.com/aoagents/agent-orchestrator/backend/internal/skillassets"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/terminal"
@@ -620,7 +622,36 @@ func Run(buildVersion string) error {
 	wireManagedPreviewExit(managedPreview, sessionSvc, log)
 	sessMgr.SetTerminalInputGate(termMgr)
 	lifecycleMessenger.Bind(sessionLifecycleMessenger{sessMgr})
+	// Mandatory delivery pipeline: the state machine (also the merge guard) and
+	// the driver behind the report, review-verdict and PR-facts hooks. A wiring
+	// fault leaves the pipeline off rather than stopping the daemon.
+	pipelineNotices, pipelineOutbox, noticesErr := newPipelineNotices(store, notificationWriter, log)
+	if noticesErr != nil {
+		// Notices are best-effort: without them the pipeline still runs and logs.
+		log.Error("pipeline notices disabled", "err", noticesErr)
+		pipelineNotices, pipelineOutbox = nil, nil
+	}
+	var pipelineNotifier pipeline.Notifier
+	if pipelineNotices != nil {
+		pipelineNotifier = pipelineNotices
+	}
+	pipelineSvc, pipelineErr := newPipelineService(store, pipelineNotifier, log)
+	var pipelineDriver *pipeline.Driver
+	if pipelineErr != nil {
+		log.Error("delivery pipeline disabled", "err", pipelineErr)
+		pipelineSvc = nil
+	} else if pipelineDriver, pipelineErr = wirePipelineDriver(ctx, pipelineSvc, store, pipelineNotices, reviewSvc, lifecycleMessenger, agentSvc, log); pipelineErr != nil {
+		log.Error("delivery pipeline driver disabled", "err", pipelineErr)
+		pipelineDriver = nil
+	} else {
+		lcStack.LCM.SetPipelineObserver(pipelineDriver)
+	}
 	lcStack.LCM.SetCompletionTerminator(sessMgr)
+	if observer, ok := sessMgr.(interface {
+		OnSessionTerminated(context.Context, domain.SessionID)
+	}); ok {
+		lcStack.LCM.SetTerminationObserver(observer)
+	}
 	lcStack.LCM.SetSessionInputLease(sessMgr)
 	lcStack.LCM.SetSessionOperationGate(sessMgr)
 	termMgr.SetSessionInputLease(sessMgr)
@@ -630,9 +661,19 @@ func Run(buildVersion string) error {
 		return errors.New("wire report delivery: session manager lacks semantic send support")
 	}
 	var reportCoordinator *reportsvc.Coordinator
-	reportSvc := reportsvc.New(reportsvc.Deps{Store: store, Artifacts: chatSvc, OnCreated: func(domain.ReportRecord) {
+	childDone, _ := sessMgr.(interface {
+		OnChildReportedDone(context.Context, domain.SessionID)
+	})
+	reportSvc := reportsvc.New(reportsvc.Deps{Store: store, Artifacts: chatSvc, OnCreated: func(rec domain.ReportRecord) {
 		if reportCoordinator != nil {
 			reportCoordinator.Wake()
+		}
+		if pipelineDriver != nil {
+			pipelineDriver.OnReport(rec.SessionID, rec.State == domain.ReportDone)
+		}
+		// A done report does not end the session; tell a live parent once.
+		if rec.State == domain.ReportDone && childDone != nil {
+			childDone.OnChildReportedDone(context.WithoutCancel(ctx), rec.SessionID)
 		}
 	}})
 	reportCoordinator = reportsvc.NewCoordinator(reportsvc.CoordinatorDeps{
@@ -640,6 +681,9 @@ func Run(buildVersion string) error {
 		Delivery: reportSemanticDelivery{chat: chatSvc, sessions: reportSessions, store: store},
 	})
 	chatSvc.SetReportCoordinator(reportCoordinator)
+	if pipelineOutbox != nil {
+		pipelineOutbox.SetWake(reportCoordinator.Wake)
+	}
 	reportDeliveryDone := reportCoordinator.Start(ctx)
 	defer func() {
 		stop()
@@ -825,6 +869,9 @@ func Run(buildVersion string) error {
 			ThreadWriter: store,
 			Lifecycle:    lcStack.LCM,
 			Logger:       log,
+			// Merge enforcement: a nil guard or lookup leaves the merge path as is.
+			Pipeline: pipelineGuard(pipelineSvc),
+			Sessions: store,
 		})
 	} else {
 		log.Warn("pr action service disabled: no usable SCM provider")
@@ -853,7 +900,12 @@ func Run(buildVersion string) error {
 	agentSvc.WarmCodexAccounts()
 	automationSvc, automationDone := startAutomations(ctx, store, sessionSvc, log)
 	lcStack.automationDone = automationDone
-	autoReview := autoreview.New(store, reviewSvc, autoreview.Config{Logger: log})
+	// The pipeline's periodic pass rides the auto-review sweep ticker.
+	var sweepHooks []autoreview.SweepHook
+	if pipelineDriver != nil {
+		sweepHooks = append(sweepHooks, pipelineDriver.Sweep)
+	}
+	autoReview := autoreview.New(store, reviewSvc, autoreview.Config{Logger: log, SweepHooks: sweepHooks})
 	lcStack.autoReviewDone = autoReview.Start(ctx)
 	// Push-device registry: persisted phones that receive OS push notifications.
 	// A load failure must not block boot — degrade to no push rather than refusing
@@ -977,10 +1029,12 @@ func Run(buildVersion string) error {
 		SystemChecks:       systemChecks,
 		Installer:          systemInstall,
 		Sessions:           sessionSvc,
+		SessionSecret:      sessionauth.DaemonSecret(cfg.DataDir, log),
 		Automations:        automationSvc,
 		DesktopWorkspaces:  sessionSvc,
 		PRs:                prActions,
 		Reviews:            reviewSvc,
+		Pipeline:           pipelineAPI(pipelineSvc),
 		Notifications:      notifier,
 		Reports:            reportSvc,
 		NotificationStream: notificationHub,

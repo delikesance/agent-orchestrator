@@ -1162,3 +1162,47 @@ func TestSetupCallsHaveNoClientTimeout(t *testing.T) {
 		})
 	}
 }
+
+func TestSessionListChildrenSendsParentSessionID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		env  string
+		want string
+	}{
+		{"explicit id", []string{"session", "ls", "--children", "demo-9"}, "demo-1", "demo-9"},
+		{"env default", []string{"session", "ls", "--children"}, "demo-1", "demo-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := setConfigEnv(t)
+			var got string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions" {
+					if v := r.URL.Query().Get("parentSessionId"); v != "" {
+						got = v
+					}
+					_, _ = io.WriteString(w, `{"sessions":[]}`)
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			t.Cleanup(srv.Close)
+			writeRunFileFor(t, cfg, srv)
+			t.Setenv("AO_SESSION_ID", tc.env)
+			if _, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, tc.args...); err != nil {
+				t.Fatalf("ls failed: %v stderr=%s", err, errOut)
+			}
+			if got != tc.want {
+				t.Fatalf("parentSessionId = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSessionListIDRequiresChildren(t *testing.T) {
+	setConfigEnv(t)
+	if _, _, err := executeCLI(t, Deps{}, "session", "ls", "demo-1"); err == nil {
+		t.Fatal("expected usage error for id without --children")
+	}
+}

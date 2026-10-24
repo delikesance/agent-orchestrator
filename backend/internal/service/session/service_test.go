@@ -3149,6 +3149,72 @@ func TestSpawnStandaloneWorkerDoesNotRequireProject(t *testing.T) {
 	}
 }
 
+func TestSpawnMapsGuardrailSentinelsTo409(t *testing.T) {
+	cases := map[string]error{
+		"SPAWN_DEPTH_EXCEEDED": sessionmanager.ErrSpawnDepthExceeded,
+		"TOO_MANY_CHILDREN":    sessionmanager.ErrTooManyChildren,
+		"TOO_MANY_WORKERS":     sessionmanager.ErrTooManyWorkers,
+		"TIER_EXCEEDS_PARENT":  sessionmanager.ErrTierExceedsParent,
+		"INVALID_PARENT":       sessionmanager.ErrInvalidParent,
+	}
+	for code, sentinel := range cases {
+		t.Run(code, func(t *testing.T) {
+			fc := &fakeCommander{spawnErr: fmt.Errorf("spawn: %w: 4 active, max 4", sentinel)}
+			svc := &Service{manager: fc, store: newFakeStore()}
+			_, _, _, err := svc.Spawn(context.Background(), ports.SpawnConfig{Kind: domain.KindWorker, Harness: domain.HarnessCodex})
+			var e *apierr.Error
+			if !errors.As(err, &e) || e.Kind != apierr.KindConflict || e.Code != code {
+				t.Fatalf("err = %v, want apierr.Conflict %s", err, code)
+			}
+			if !strings.Contains(e.Message, "4 active, max 4") {
+				t.Fatalf("message %q lost the limit text", e.Message)
+			}
+		})
+	}
+}
+
+func TestListFiltersByParentSessionID(t *testing.T) {
+	st := newFakeStore()
+	st.sessions["p-1"] = domain.SessionRecord{ID: "p-1", ProjectID: "p"}
+	st.sessions["p-2"] = domain.SessionRecord{ID: "p-2", ProjectID: "p", ParentSessionID: "p-1", Depth: 1}
+	st.sessions["p-3"] = domain.SessionRecord{ID: "p-3", ProjectID: "p"}
+	svc := &Service{store: st}
+	list, err := svc.List(context.Background(), ListFilter{ParentSessionID: "p-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].ID != "p-2" || list[0].ParentSessionID != "p-1" || list[0].Depth != 1 {
+		t.Fatalf("list = %+v, want only child p-2", list)
+	}
+	all, err := svc.List(context.Background(), ListFilter{})
+	if err != nil || len(all) != 3 {
+		t.Fatalf("unfiltered list = %d, %v, want 3", len(all), err)
+	}
+}
+
+func TestSpawnMapsInvalidTierTo400AndCarriesTierOutcome(t *testing.T) {
+	st := newFakeStore()
+	fc := &fakeCommander{spawnErr: fmt.Errorf("spawn: %w: %q", sessionmanager.ErrInvalidTier, "turbo")}
+	svc := &Service{manager: fc, store: st}
+	_, _, _, err := svc.Spawn(context.Background(), ports.SpawnConfig{Kind: domain.KindWorker, Harness: domain.HarnessCodex, Tier: "turbo"})
+	var e *apierr.Error
+	if !errors.As(err, &e) || e.Kind != apierr.KindInvalid || e.Code != "INVALID_TIER" {
+		t.Fatalf("err = %v, want apierr.Invalid INVALID_TIER", err)
+	}
+
+	fc = &fakeCommander{spawnRecord: domain.SessionRecord{
+		ID: "tier-1", Kind: domain.KindWorker, Harness: domain.HarnessCodex, TierApplied: true, TierWarning: "w",
+	}}
+	svc = &Service{manager: fc, store: st}
+	sess, _, _, err := svc.Spawn(context.Background(), ports.SpawnConfig{Kind: domain.KindWorker, Harness: domain.HarnessCodex, Tier: domain.TierFast})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if !sess.TierApplied || sess.TierWarning != "w" {
+		t.Fatalf("tier outcome = (%v, %q), want carried from the record", sess.TierApplied, sess.TierWarning)
+	}
+}
+
 func TestSpawnStandaloneRejectsProjectFeatures(t *testing.T) {
 	for _, cfg := range []ports.SpawnConfig{
 		{Kind: domain.KindOrchestrator, Harness: domain.HarnessCodex},

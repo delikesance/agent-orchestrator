@@ -34,6 +34,7 @@ import (
 	reviewsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/review"
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
 	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
 
@@ -79,6 +80,7 @@ func startLifecycle(ctx context.Context, dataDir string, store *sqlite.Store, ru
 		lifecycle.WithStartupSignalGate(startupSignalGatesInput(agents)),
 		lifecycle.WithUrgentNudgeGate(urgentNudgeWaitingInputSafe(agents)),
 		lifecycle.WithDataDir(dataDir),
+		lifecycle.WithLogger(logger),
 	)
 	rp := reaper.New(lcm, store, runtime, reaper.Config{Logger: logger})
 	activityPoller := activityobserver.New(store, lcm, runtime, agents, activityobserver.Config{Logger: logger, DataDir: dataDir})
@@ -325,6 +327,8 @@ func startSession(ctx context.Context, cfg config.Config, runtime runtimeselect.
 		BrowserCapabilities: browserCapabilities,
 		DataDir:             cfg.DataDir,
 		RunFilePath:         cfg.RunFilePath,
+		SessionSecret:       sessionauth.DaemonSecret(cfg.DataDir, log),
+		StrictSessionAuth:   sessionauth.StrictFromEnv(),
 		BackgroundContext:   ctx,
 		Logger:              log,
 		ReconcileWorkers:    startupReconcileWorkers,
@@ -377,6 +381,7 @@ func startSession(ctx context.Context, cfg config.Config, runtime runtimeselect.
 		Projects:   store,
 		Launcher: reviewcore.NewLauncher(reviewers, runtime, cfg.DataDir,
 			reviewcore.WithRunFilePath(cfg.RunFilePath),
+			reviewcore.WithSessionSecret(sessionauth.DaemonSecret(cfg.DataDir, log)),
 			reviewcore.WithAgentAuth(reviewerAgentAuth{readiness: agentReadiness}),
 			reviewcore.WithReviewerChat(reviewerChat)),
 
@@ -386,6 +391,7 @@ func startSession(ctx context.Context, cfg config.Config, runtime runtimeselect.
 		reviewsvc.WithTelemetry(telemetry),
 		reviewsvc.WithNotificationSink(notifications),
 		reviewsvc.WithCodexAccountOperationGate(codexOperationGate),
+		reviewsvc.WithSessionSecret(sessionauth.DaemonSecret(cfg.DataDir, log)),
 	}
 	if scmProvider != nil {
 		reviewOpts = append(reviewOpts,

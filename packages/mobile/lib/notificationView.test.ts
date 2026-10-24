@@ -33,6 +33,11 @@ describe("notificationVisual", () => {
 		expect(new Set(icons).size).toBe(4);
 	});
 
+	it("marks a pipeline escalation as an error alert with a readable label", () => {
+		const v = notificationVisual(darkTheme, "pipeline_escalated");
+		expect(v).toEqual({ icon: "circle-alert", color: darkTheme.red, label: "Pipeline escalated" });
+	});
+
 	it("falls back to a usable label for an unknown type", () => {
 		expect(notificationVisual(darkTheme, "something_new").label).toBe("something_new");
 		expect(notificationVisual(darkTheme, "").label).toBe("Notification");
@@ -87,6 +92,12 @@ describe("notificationTarget", () => {
 		expect(notificationTarget({ type: "", hostId: "host-a" }, "host-a")).toBe("/prs?hostId=host-a");
 		expect(notificationTarget({ type: "", sessionId: "abc", hostId: "host-a" }, "host-a")).toBe("/prs?hostId=host-a");
 		expect(notificationTarget({ type: "something_new", sessionId: "abc", hostId: "host-a" }, "host-a")).toBe("/prs?hostId=host-a");
+	});
+});
+
+describe("notificationTarget pipeline_escalated", () => {
+	it("opens the session, not the PR list", () => {
+		expect(notificationTarget({ type: "pipeline_escalated", sessionId: "abc", hostId: "host-a" }, "host-a")).toBe("/session/abc?hostId=host-a");
 	});
 });
 
@@ -184,6 +195,11 @@ describe("notificationAction", () => {
 			expect(notificationAction({ type, sessionId: "s1" }, { terminated: true, sessionsReady: true }))
 				.toEqual({ kind: "open", sessionId: "s1" });
 		}
+	});
+
+	it("opens a pipeline escalation session even when terminated", () => {
+		expect(notificationAction({ type: "pipeline_escalated", sessionId: "s1" }, { terminated: true, sessionsReady: true }))
+			.toEqual({ kind: "open", sessionId: "s1" });
 	});
 
 	it("waits rather than guessing before the board has loaded", () => {

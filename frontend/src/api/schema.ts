@@ -3145,6 +3145,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sessions/{sessionId}/pipeline": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a session's delivery pipeline status with full gate evidence */
+        get: operations["getSessionPipeline"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sessions/{sessionId}/pipeline/override": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Override an escalated session's pipeline to ready (a person only) */
+        post: operations["overrideSessionPipeline"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sessions/{sessionId}/pipeline/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Retry an escalated session's pipeline (orchestrator of the project or a person) */
+        post: operations["retrySessionPipeline"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sessions/{sessionId}/pr": {
         parameters: {
             query?: never;
@@ -5165,9 +5216,11 @@ export interface components {
             chatProviderPreserved: boolean;
             /** Format: date-time */
             createdAt: string;
+            depth: number;
             displayName?: string;
             /** @enum {string} */
             displayStatus: "Working" | "Blocked" | "Exited" | "No signal" | "Interrupted" | "Awaiting PR" | "Fixing CI failures" | "Addressing comments" | "Needs review" | "Review scheduled" | "Reviewing" | "Review failed" | "Review pending" | "Draft" | "CI failing" | "Commented" | "Changes requested" | "Needs human review" | "Mergeable" | "Approved" | "Merged" | "Closed without merge" | "Terminated";
+            effort?: string;
             harness?: string;
             /** Format: date-time */
             hibernatedAt?: null | string;
@@ -5189,8 +5242,10 @@ export interface components {
             model?: string;
             /** @enum {string} */
             outputType: "none" | "pr" | "artifact" | "pr_artifact";
+            parentSessionId?: string;
             /** Format: date-time */
             pinnedAt?: null | string;
+            pipeline?: components["schemas"]["SessionPipeline"];
             /** Format: int64 */
             previewRevision?: number;
             previewUrl?: string;
@@ -5215,6 +5270,7 @@ export interface components {
             terminalGeneration?: string;
             terminalHandleId?: string;
             terminateOnPrMerge: boolean;
+            tier?: string;
             /** Format: date-time */
             updatedAt: string;
             /** @enum {string} */
@@ -5599,6 +5655,8 @@ export interface components {
             model?: string;
             projectId: string;
             taskPreparation?: string;
+            /** @enum {string} */
+            tier?: "fast" | "standard" | "deep";
         };
         DelegateTaskResponse: {
             ok: boolean;
@@ -6037,6 +6095,8 @@ export interface components {
         MergePRResponse: {
             method: string;
             ok: boolean;
+            /** @description Set when the merge was allowed in pipeline warn mode despite a violation; names the violation. */
+            pipelineWarning?: string;
             prNumber: number;
             /** @enum {string} */
             state: "merged";
@@ -6117,7 +6177,7 @@ export interface components {
             target: components["schemas"]["NotificationTarget"];
             title: string;
             /** @enum {string} */
-            type: "needs_input" | "ready_to_merge" | "pr_merged" | "pr_closed_unmerged" | "review_completed" | "review_changes_requested";
+            type: "needs_input" | "ready_to_merge" | "pr_merged" | "pr_closed_unmerged" | "review_completed" | "review_changes_requested" | "pipeline_escalated";
         };
         NotificationTarget: {
             /** @enum {string} */
@@ -6155,6 +6215,59 @@ export interface components {
             status: "needs_review" | "running" | "up_to_date" | "changes_requested" | "ineligible";
             targetSha: string;
             title: string;
+        };
+        PipelineActionResponse: {
+            attempt: number;
+            from: string;
+            maxAttempts: number;
+            sessionId: string;
+            to: string;
+        };
+        PipelineConfig: {
+            enabled?: null | boolean;
+            /** @enum {string} */
+            enforce?: "off" | "warn" | "on";
+            maxAttempts?: number;
+            /** @enum {string} */
+            reviewerTier?: "fast" | "standard" | "deep";
+            /** @enum {string} */
+            validation?: "commands" | "ci-only";
+            validationCommands?: string[];
+        };
+        PipelineGateDetail: {
+            attempt: number;
+            /** Format: date-time */
+            createdAt: string;
+            /** @description The gate's stored evidence document as a JSON string, including command output tails. */
+            evidence?: string;
+            /** @description One-line summary of the gate evidence; the raw output is only on GET /sessions/{sessionId}/pipeline. */
+            evidenceSummary?: string;
+            headSha: string;
+            /** @enum {string} */
+            result: "pass" | "fail" | "override";
+            reviewRunId?: string;
+            /** @enum {string} */
+            stage: "validating" | "review";
+        };
+        PipelineOverrideRequest: {
+            /** @description Why the escalated session is accepted as is. Recorded on the override gate. */
+            reason: string;
+        };
+        PipelineStatusResponse: {
+            attempt: number;
+            /** @description True when a merge of this session is currently blocked. */
+            blocking: boolean;
+            /** @enum {string} */
+            enforce: "off" | "warn" | "on";
+            enforced: boolean;
+            gates: components["schemas"]["PipelineGateDetail"][];
+            maxAttempts: number;
+            sessionId: string;
+            /**
+             * @description Empty for a legacy session the pipeline does not apply to.
+             * @enum {string}
+             */
+            stage: "" | "building" | "validating" | "review" | "ready" | "merged" | "escalated";
         };
         PrepareTaskResponse: {
             ok: boolean;
@@ -6214,6 +6327,7 @@ export interface components {
             };
             orchestrator?: components["schemas"]["RoleOverride"];
             orchestratorRules?: string;
+            pipeline?: components["schemas"]["PipelineConfig"];
             postCreate?: string[];
             preRemove?: string[];
             reviewers?: components["schemas"]["DomainReviewerConfig"][];
@@ -6747,6 +6861,31 @@ export interface components {
             reviewUrl?: string;
             reviewerId: string;
         };
+        SessionPipeline: {
+            attempt: number;
+            /**
+             * @description Rollout mode: off records nothing, warn records gates but never blocks a merge, on blocks a merge until the session is ready.
+             * @enum {string}
+             */
+            enforce: "off" | "warn" | "on";
+            gates: components["schemas"]["SessionPipelineGate"][];
+            maxAttempts: number;
+            /** @enum {string} */
+            stage: "building" | "validating" | "review" | "ready" | "merged" | "escalated";
+        };
+        SessionPipelineGate: {
+            attempt: number;
+            /** Format: date-time */
+            createdAt: string;
+            /** @description One-line summary of the gate evidence; the raw output is only on GET /sessions/{sessionId}/pipeline. */
+            evidenceSummary?: string;
+            headSha: string;
+            /** @enum {string} */
+            result: "pass" | "fail" | "override";
+            reviewRunId?: string;
+            /** @enum {string} */
+            stage: "validating" | "review";
+        };
         SessionPreviewResponse: {
             entry?: string;
             previewUrl?: string;
@@ -7177,12 +7316,16 @@ export interface components {
             /** @enum {string} */
             requestedOutput?: "artifact";
             /** @enum {string} */
+            tier?: "fast" | "standard" | "deep";
+            /** @enum {string} */
             trackerProvider?: "github" | "gitlab";
         };
         SpawnSessionResponse: {
             promptBytes: number;
             session: components["schemas"]["ControllersSessionView"];
             systemPromptBytes: number;
+            tierApplied?: null | boolean;
+            warnings?: string[];
         };
         StageSessionAttachmentsRequest: {
             attachments: components["schemas"]["AttachmentInput"][];
@@ -7379,6 +7522,11 @@ export interface components {
              * @enum {string}
              */
             source?: "manual" | "agent";
+            /**
+             * @description What the pass reviews: pr (the worker's pull requests, the default) or branch (the session branch head against its base, for a session with no PR).
+             * @enum {string}
+             */
+            target?: "pr" | "branch";
         };
         TriggerReviewResponse: {
             /** @description True when this request turned the worker session's review auto-inject on. */
@@ -14768,6 +14916,8 @@ export interface operations {
                 orchestratorOnly?: null | boolean;
                 /** @description When true, return only fresh non-terminated sessions. */
                 fresh?: null | boolean;
+                /** @description When set, return only direct children of this parent session. */
+                parentSessionId?: string;
             };
             header?: never;
             path?: never;
@@ -14837,6 +14987,15 @@ export interface operations {
             };
             /** @description Not Found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Conflict */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -18897,6 +19056,178 @@ export interface operations {
             };
             /** @description Internal Server Error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    getSessionPipeline: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session identifier, e.g. project-1. */
+                sessionId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PipelineStatusResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    overrideSessionPipeline: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session identifier, e.g. project-1. */
+                sessionId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PipelineOverrideRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PipelineActionResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    retrySessionPipeline: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session identifier, e.g. project-1. */
+                sessionId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PipelineActionResponse"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Conflict */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

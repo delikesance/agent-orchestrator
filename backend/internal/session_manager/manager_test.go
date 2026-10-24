@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -39,7 +40,7 @@ func TestSeedRecordPreservesAutomationRunIdentity(t *testing.T) {
 	rec := seedRecord(ports.SpawnConfig{
 		ProjectID: "scheduled", Kind: domain.KindWorker,
 		AutomationRunID: &runID,
-	}, domain.ProjectConfig{}, time.Date(2026, time.August, 25, 9, 0, 0, 0, time.UTC))
+	}, domain.ProjectConfig{}, time.Date(2026, time.August, 25, 9, 0, 0, 0, time.UTC), 1)
 	if rec.AutomationRunID == nil || *rec.AutomationRunID != runID {
 		t.Fatalf("automation run id = %v, want %q", rec.AutomationRunID, runID)
 	}
@@ -127,6 +128,14 @@ func (f *fakeStore) CreateClientRequestSession(ctx context.Context, rec domain.S
 func (f *fakeStore) GetSessionByClientRequestID(_ context.Context, id string) (domain.SessionRecord, bool, error) {
 	for _, rec := range f.sessions {
 		if id != "" && rec.ClientRequestID == id {
+			return rec, true, nil
+		}
+	}
+	return domain.SessionRecord{}, false, nil
+}
+func (f *fakeStore) GetSessionByAutomationRunID(_ context.Context, id domain.AutomationRunID) (domain.SessionRecord, bool, error) {
+	for _, rec := range f.sessions {
+		if rec.AutomationRunID != nil && *rec.AutomationRunID == id {
 			return rec, true, nil
 		}
 	}
@@ -393,6 +402,25 @@ func (f *fakeStore) ListAllSessions(context.Context) ([]domain.SessionRecord, er
 	for _, r := range f.sessions {
 		out = append(out, r)
 	}
+	return out, nil
+}
+func (f *fakeStore) CountLiveChildSessions(_ context.Context, parent domain.SessionID) (int, error) {
+	n := 0
+	for _, r := range f.sessions {
+		if r.ParentSessionID == parent && !r.IsTerminated {
+			n++
+		}
+	}
+	return n, nil
+}
+func (f *fakeStore) ListChildSessions(_ context.Context, parent domain.SessionID) ([]domain.SessionRecord, error) {
+	var out []domain.SessionRecord
+	for _, r := range f.sessions {
+		if r.ParentSessionID == parent {
+			out = append(out, r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
 }
 func (f *fakeStore) ListChatHibernationCandidates(ctx context.Context) ([]domain.SessionID, error) {
@@ -12101,5 +12129,375 @@ func TestPromptOutputContainsMatchesAStyledPrompt(t *testing.T) {
 	}
 	if promptOutputContains("\x1b[34mloading…\x1b[39m", []string{"│ >"}) {
 		t.Fatal("output without the prompt matched")
+	}
+}
+
+// tierClaudeCatalog mirrors a live Claude Code catalog: bare family aliases
+// beside concrete versions, Haiku advertising no efforts.
+func tierClaudeCatalog() tuningCatalog {
+	return tuningCatalog{catalog: ports.AgentModelCatalog{Models: []ports.AgentModelInfo{
+		{ID: "opus"},
+		{ID: "haiku"},
+		{ID: "sonnet", IsDefault: true, Efforts: []string{"low", "medium", "high"}},
+		{ID: "claude-opus-5-5", Efforts: []string{"low", "medium", "high", "xhigh"}},
+		{ID: "claude-sonnet-5-5", Efforts: []string{"low", "medium", "high"}},
+		{ID: "claude-haiku-4-5"},
+	}}}
+}
+
+func spawnTier(t *testing.T, m *Manager, cfg ports.SpawnConfig) (domain.SessionRecord, error) {
+	t.Helper()
+	cfg.Kind = domain.KindWorker
+	cfg.ProjectID = "mer"
+	cfg.RequestedMode = domain.SessionModeTUI
+	rec, _, _, err := m.Spawn(ctx, cfg)
+	return rec, err
+}
+
+func TestSpawn_TierFastOnClaudeUsesHaikuWithoutEffort(t *testing.T) {
+	m, st, _, _ := newManager()
+	agent := &recordingAgent{}
+	m.agents = singleAgent{agent: agent}
+	m.SetModelCatalog(tierClaudeCatalog())
+	// An inherited project effort must not ride along onto a model with none.
+	proj := st.projects["mer"]
+	proj.Config.AgentConfig = domain.AgentConfig{Model: "sonnet", Effort: "high"}
+	st.projects["mer"] = proj
+
+	rec, err := spawnTier(t, m, ports.SpawnConfig{Harness: domain.HarnessClaudeCode, Tier: domain.TierFast})
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if agent.lastConfig.Model != "haiku" || agent.lastConfig.Effort != "" {
+		t.Fatalf("launch config = %+v, want haiku with no effort", agent.lastConfig)
+	}
+	if !rec.TierApplied || rec.TierWarning != "" {
+		t.Fatalf("tier outcome = (%v, %q), want applied without warning", rec.TierApplied, rec.TierWarning)
+	}
+	if got := st.sessions[rec.ID].Metadata.Model; got != "haiku" {
+		t.Fatalf("persisted model = %q, want haiku", got)
+	}
+}
+
+func TestSpawn_ExplicitModelBeatsTier(t *testing.T) {
+	m, _, _, _ := newManager()
+	agent := &recordingAgent{}
+	m.agents = singleAgent{agent: agent}
+	m.SetModelCatalog(tierClaudeCatalog())
+
+	rec, err := spawnTier(t, m, ports.SpawnConfig{
+		Harness: domain.HarnessClaudeCode, Tier: domain.TierDeep,
+		AgentConfig: ports.AgentConfig{Model: "sonnet"},
+	})
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if agent.lastConfig.Model != "sonnet" {
+		t.Fatalf("launch model = %q, want the explicit sonnet", agent.lastConfig.Model)
+	}
+	if agent.lastConfig.Effort != "" {
+		t.Fatalf("launch effort = %q, want none (the tier's effort belongs to its own model)", agent.lastConfig.Effort)
+	}
+	if rec.TierApplied || !strings.Contains(rec.TierWarning, "explicit model") {
+		t.Fatalf("tier outcome = (%v, %q), want not applied with a warning that the explicit model won", rec.TierApplied, rec.TierWarning)
+	}
+}
+
+func TestSpawn_TierFastWithExplicitEffortHaikuLacksKeepsRoleModel(t *testing.T) {
+	m, st, _, _ := newManager()
+	agent := &recordingAgent{}
+	m.agents = singleAgent{agent: agent}
+	m.SetModelCatalog(tierClaudeCatalog())
+	proj := st.projects["mer"]
+	proj.Config.Worker.AgentConfig = domain.AgentConfig{Model: "sonnet"}
+	st.projects["mer"] = proj
+
+	rec, err := spawnTier(t, m, ports.SpawnConfig{
+		Harness: domain.HarnessClaudeCode, Tier: domain.TierFast,
+		AgentConfig:    ports.AgentConfig{Effort: "high"},
+		EffortOverride: true,
+	})
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if agent.lastConfig.Model != "sonnet" || agent.lastConfig.Effort != "high" {
+		t.Fatalf("launch config = %+v, want the role's sonnet with the explicit effort high", agent.lastConfig)
+	}
+	if rec.TierApplied {
+		t.Fatal("tier model cannot take the explicit effort, want TierApplied=false")
+	}
+	for _, want := range []string{"fast", "haiku", "high"} {
+		if !strings.Contains(rec.TierWarning, want) {
+			t.Fatalf("warning %q does not name %q", rec.TierWarning, want)
+		}
+	}
+}
+
+func TestSpawn_TierFastWithExplicitEffortHaikuSupportsAppliesModel(t *testing.T) {
+	m, _, _, _ := newManager()
+	agent := &recordingAgent{}
+	m.agents = singleAgent{agent: agent}
+	m.SetModelCatalog(tuningCatalog{catalog: ports.AgentModelCatalog{Models: []ports.AgentModelInfo{
+		{ID: "haiku", Efforts: []string{"low", "high"}},
+		{ID: "sonnet", IsDefault: true, Efforts: []string{"low", "medium", "high"}},
+	}}})
+
+	rec, err := spawnTier(t, m, ports.SpawnConfig{
+		Harness: domain.HarnessClaudeCode, Tier: domain.TierFast,
+		AgentConfig:    ports.AgentConfig{Effort: "high"},
+		EffortOverride: true,
+	})
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if agent.lastConfig.Model != "haiku" || agent.lastConfig.Effort != "high" {
+		t.Fatalf("launch config = %+v, want haiku with the explicit effort high", agent.lastConfig)
+	}
+	if !rec.TierApplied || rec.TierWarning != "" {
+		t.Fatalf("tier outcome = (%v, %q), want applied without warning", rec.TierApplied, rec.TierWarning)
+	}
+}
+
+func TestSpawn_TierEffortDoesNotAssumeAscendingEfforts(t *testing.T) {
+	cases := []struct {
+		name    string
+		efforts []string
+		tier    domain.WorkerTier
+		want    string
+	}{
+		{"fast unordered", []string{"high", "low", "medium"}, domain.TierFast, "low"},
+		{"deep unordered", []string{"medium", "high", "low"}, domain.TierDeep, "high"},
+		{"deep capped unordered", []string{"xhigh", "low", "high"}, domain.TierDeep, "high"},
+		{"unknown names ignored", []string{"turbo", "medium", "ludicrous"}, domain.TierFast, "medium"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _, _, _ := newManager()
+			agent := &recordingAgent{}
+			m.agents = singleAgent{agent: agent}
+			m.SetModelCatalog(tuningCatalog{catalog: ports.AgentModelCatalog{Models: []ports.AgentModelInfo{
+				{ID: "gpt-5.6-sol", IsDefault: true, Efforts: tc.efforts},
+			}}})
+			if _, err := spawnTier(t, m, ports.SpawnConfig{Harness: domain.HarnessCodex, Tier: tc.tier}); err != nil {
+				t.Fatalf("spawn: %v", err)
+			}
+			if agent.lastConfig.Effort != tc.want {
+				t.Fatalf("launch effort = %q, want %q", agent.lastConfig.Effort, tc.want)
+			}
+		})
+	}
+}
+
+func TestSpawn_ExplicitEffortBeatsTierEffortWhileTierModelStays(t *testing.T) {
+	m, _, _, _ := newManager()
+	agent := &recordingAgent{}
+	m.agents = singleAgent{agent: agent}
+	m.SetModelCatalog(tierClaudeCatalog())
+
+	rec, err := spawnTier(t, m, ports.SpawnConfig{
+		Harness: domain.HarnessClaudeCode, Tier: domain.TierDeep,
+		AgentConfig:    ports.AgentConfig{Effort: "low"},
+		EffortOverride: true,
+	})
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if agent.lastConfig.Model != "opus" || agent.lastConfig.Effort != "low" {
+		t.Fatalf("launch config = %+v, want the tier's opus with the explicit effort low", agent.lastConfig)
+	}
+	if !rec.TierApplied {
+		t.Fatal("tier supplied the model, want TierApplied")
+	}
+}
+
+func TestSpawn_TierDeepOnClaudeFillsModelAndEffort(t *testing.T) {
+	m, _, _, _ := newManager()
+	agent := &recordingAgent{}
+	m.agents = singleAgent{agent: agent}
+	m.SetModelCatalog(tierClaudeCatalog())
+
+	if _, err := spawnTier(t, m, ports.SpawnConfig{Harness: domain.HarnessClaudeCode, Tier: domain.TierDeep}); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if agent.lastConfig.Model != "opus" || agent.lastConfig.Effort != "high" {
+		t.Fatalf("launch config = %+v, want opus/high", agent.lastConfig)
+	}
+}
+
+func TestSpawn_TierOnUnsupportedHarnessIsNoOp(t *testing.T) {
+	m, _, _, _ := newManager()
+	agent := &recordingAgent{}
+	m.agents = singleAgent{agent: agent}
+	m.SetModelCatalog(tuningCatalog{catalog: ports.AgentModelCatalog{Models: []ports.AgentModelInfo{
+		{ID: "gemini-2.5-pro", IsDefault: true, Efforts: []string{"low", "high"}},
+	}}})
+
+	// Droid cannot vary effort: neither tier may fail the spawn with
+	// ErrUnsupportedEffort or leak a model or effort into the launch.
+	for _, tier := range []domain.WorkerTier{domain.TierFast, domain.TierDeep} {
+		rec, err := spawnTier(t, m, ports.SpawnConfig{Harness: domain.HarnessDroid, Tier: tier})
+		if err != nil {
+			t.Fatalf("tier %s: spawn: %v", tier, err)
+		}
+		if agent.lastConfig.Model != "" || agent.lastConfig.Effort != "" {
+			t.Fatalf("tier %s: launch config = %+v, want no tier-derived model or effort", tier, agent.lastConfig)
+		}
+		if rec.TierApplied || rec.TierWarning == "" {
+			t.Fatalf("tier %s: outcome = (%v, %q), want not applied with a warning", tier, rec.TierApplied, rec.TierWarning)
+		}
+	}
+}
+
+func TestSpawn_TierEffortNeverRaisesUnsupportedEffort(t *testing.T) {
+	m, _, _, _ := newManager()
+	agent := &recordingAgent{}
+	m.agents = singleAgent{agent: agent}
+	// Codex: tier effort comes from the current model's own levels.
+	m.SetModelCatalog(tuningCatalog{catalog: ports.AgentModelCatalog{Models: []ports.AgentModelInfo{
+		{ID: "gpt-5.6-sol", IsDefault: true, Efforts: []string{"low", "medium", "high"}},
+	}}})
+	rec, err := spawnTier(t, m, ports.SpawnConfig{Harness: domain.HarnessCodex, Tier: domain.TierFast})
+	if err != nil {
+		t.Fatalf("codex spawn: %v", err)
+	}
+	if agent.lastConfig.Effort != "low" || agent.lastConfig.Model != "" || !rec.TierApplied {
+		t.Fatalf("codex launch config = %+v applied=%v, want effort low only", agent.lastConfig, rec.TierApplied)
+	}
+	// An explicit effort the harness cannot honor still fails: only the tier's
+	// own effort degrades silently.
+	_, err = spawnTier(t, m, ports.SpawnConfig{
+		Harness: domain.HarnessDroid, Tier: domain.TierFast,
+		AgentConfig: ports.AgentConfig{Effort: "high"}, EffortOverride: true,
+	})
+	if !errors.Is(err, ports.ErrUnsupportedEffort) {
+		t.Fatalf("explicit effort err = %v, want ErrUnsupportedEffort", err)
+	}
+}
+
+func TestSpawn_TierStandardKeepsRoleAndProjectModel(t *testing.T) {
+	for _, tier := range []domain.WorkerTier{"", domain.TierStandard} {
+		m, st, _, _ := newManager()
+		agent := &recordingAgent{}
+		m.agents = singleAgent{agent: agent}
+		m.SetModelCatalog(tierClaudeCatalog())
+		proj := st.projects["mer"]
+		proj.Config.Worker.AgentConfig = domain.AgentConfig{Model: "sonnet", Effort: "medium"}
+		st.projects["mer"] = proj
+
+		rec, err := spawnTier(t, m, ports.SpawnConfig{Harness: domain.HarnessClaudeCode, Tier: tier})
+		if err != nil {
+			t.Fatalf("tier %q: spawn: %v", tier, err)
+		}
+		if agent.lastConfig.Model != "sonnet" || agent.lastConfig.Effort != "medium" {
+			t.Fatalf("tier %q: launch config = %+v, want the role's sonnet/medium", tier, agent.lastConfig)
+		}
+		if rec.TierApplied || rec.TierWarning != "" {
+			t.Fatalf("tier %q: outcome = (%v, %q), want none", tier, rec.TierApplied, rec.TierWarning)
+		}
+	}
+}
+
+// tierConcreteClaudeCatalog mirrors what the live provider lookup returns: the
+// provider's concrete IDs only, with no bare family alias entries.
+func tierConcreteClaudeCatalog() tuningCatalog {
+	return tuningCatalog{catalog: ports.AgentModelCatalog{Models: []ports.AgentModelInfo{
+		{ID: "claude-opus-4-1", Efforts: []string{"low", "high"}},
+		{ID: "claude-opus-5-5", Efforts: []string{"low", "medium", "high", "xhigh"}},
+		{ID: "claude-sonnet-5-5", IsDefault: true, Efforts: []string{"low", "medium", "high"}},
+		{ID: "claude-haiku-4-5"},
+	}}}
+}
+
+func TestSpawn_TierOnClaudeResolvesConcreteIDsWithoutAliasEntries(t *testing.T) {
+	cases := []struct {
+		name       string
+		catalog    tuningCatalog
+		tier       domain.WorkerTier
+		wantModel  string
+		wantEffort string
+		wantApply  bool
+	}{
+		{"concrete fast", tierConcreteClaudeCatalog(), domain.TierFast, "claude-haiku-4-5", "", true},
+		{"concrete deep", tierConcreteClaudeCatalog(), domain.TierDeep, "claude-opus-5-5", "high", true},
+		{"concrete standard", tierConcreteClaudeCatalog(), domain.TierStandard, "", "", false},
+		{"alias fast", tierClaudeCatalog(), domain.TierFast, "haiku", "", true},
+		{"alias deep", tierClaudeCatalog(), domain.TierDeep, "opus", "high", true},
+		{"alias standard", tierClaudeCatalog(), domain.TierStandard, "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _, _, _ := newManager()
+			agent := &recordingAgent{}
+			m.agents = singleAgent{agent: agent}
+			m.SetModelCatalog(tc.catalog)
+
+			rec, err := spawnTier(t, m, ports.SpawnConfig{Harness: domain.HarnessClaudeCode, Tier: tc.tier})
+			if err != nil {
+				t.Fatalf("spawn: %v", err)
+			}
+			if tc.wantApply && (agent.lastConfig.Model != tc.wantModel || agent.lastConfig.Effort != tc.wantEffort) {
+				t.Fatalf("launch config = %+v, want %s/%q", agent.lastConfig, tc.wantModel, tc.wantEffort)
+			}
+			if rec.TierApplied != tc.wantApply {
+				t.Fatalf("TierApplied = %v, want %v (warning %q)", rec.TierApplied, tc.wantApply, rec.TierWarning)
+			}
+		})
+	}
+}
+
+func TestSpawn_TierWithMissingFamilyFallsBackWithWarning(t *testing.T) {
+	m, _, _, _ := newManager()
+	agent := &recordingAgent{}
+	m.agents = singleAgent{agent: agent}
+	m.SetModelCatalog(tuningCatalog{catalog: ports.AgentModelCatalog{Models: []ports.AgentModelInfo{
+		{ID: "claude-sonnet-5-5", IsDefault: true, Efforts: []string{"low", "medium", "high"}},
+	}}})
+
+	for _, tier := range []domain.WorkerTier{domain.TierFast, domain.TierDeep} {
+		rec, err := spawnTier(t, m, ports.SpawnConfig{Harness: domain.HarnessClaudeCode, Tier: tier})
+		if err != nil {
+			t.Fatalf("tier %s: spawn: %v", tier, err)
+		}
+		if rec.TierApplied || rec.TierWarning == "" {
+			t.Fatalf("tier %s: outcome = (%v, %q), want not applied with a warning", tier, rec.TierApplied, rec.TierWarning)
+		}
+	}
+}
+
+func TestSpawn_InvalidTierFailsBeforeSessionRow(t *testing.T) {
+	m, st, rt, _ := newManager()
+	m.SetModelCatalog(tierClaudeCatalog())
+
+	_, err := spawnTier(t, m, ports.SpawnConfig{Harness: domain.HarnessClaudeCode, Tier: "turbo"})
+	if !errors.Is(err, ErrInvalidTier) {
+		t.Fatalf("err = %v, want ErrInvalidTier", err)
+	}
+	if len(st.sessions) != 0 || rt.created != 0 {
+		t.Fatalf("invalid tier left state behind: sessions=%d runtimes=%d", len(st.sessions), rt.created)
+	}
+}
+
+// TestRestore_KeepsPersistedModelWithoutReresolvingTier pins that a tier is a
+// spawn-time hint only: a restore relaunches on the session's persisted
+// metadata and never consults the catalog to resolve a tier again.
+func TestRestore_KeepsPersistedModelWithoutReresolvingTier(t *testing.T) {
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer", Config: domain.ProjectConfig{AgentConfig: domain.AgentConfig{Model: "project-default-model"}}}
+	seedTerminal(st, "mer-1", domain.SessionMetadata{
+		WorkspacePath:  "/ws/mer-1",
+		Branch:         "b",
+		AgentSessionID: "agent-x",
+		Model:          "haiku",
+	})
+	agent := &recordingAgent{}
+	lookPath := func(string) (string, error) { return "/bin/true", nil }
+	m := New(Deps{Runtime: &fakeRuntime{}, Agents: singleAgent{agent: agent}, Workspace: &fakeWorkspace{}, Store: st, Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st}, LookPath: lookPath})
+	m.SetModelCatalog(tierClaudeCatalog())
+
+	if _, err := m.RestoreWithMode(ctx, "mer-1"); err != nil {
+		t.Fatalf("RestoreWithMode: %v", err)
+	}
+	if agent.lastConfig.Model != "haiku" {
+		t.Fatalf("restore model = %q, want the persisted haiku", agent.lastConfig.Model)
 	}
 }

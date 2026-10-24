@@ -1,10 +1,13 @@
 package sessionmanager
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
 func TestBuildTaskPrompt_IssueContextStaysInTaskPrompt(t *testing.T) {
@@ -389,5 +392,97 @@ func TestBuildSystemPrompt_WorkerNativeReviewFollowsProjectPolicy(t *testing.T) 
 	local := buildSystemPromptText(systemPromptConfig{Role: sessionPromptRoleWorker, Project: promptProject{ID: "mer"}})
 	if strings.Contains(local, "## AO Native Review") {
 		t.Fatalf("a project with no remote has no PRs to review:\n%s", local)
+	}
+}
+
+func TestBuildSystemPrompt_WorkerChildSpawnSection(t *testing.T) {
+	cfg := systemPromptConfig{Role: sessionPromptRoleWorker, Project: promptProject{ID: "mer", Name: "Mercury", DefaultBranch: "main", Path: "/repo/mercury"}}
+	got := buildSystemPromptText(cfg)
+	for _, want := range []string{
+		"## Spawning Small Child Workers",
+		"ao spawn --tier fast --prompt",
+		"ao session ls --children",
+		fmt.Sprintf("at most %d live children", DefaultMaxActiveChildren),
+		fmt.Sprintf("%d live workers", DefaultMaxActiveWorkers),
+		fmt.Sprintf("depth at most %d", DefaultMaxSpawnDepth),
+		"merging the child branch yourself",
+		"higher tier",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("worker prompt missing %q:\n%s", want, got)
+		}
+	}
+	cfg.Depth = DefaultMaxSpawnDepth
+	if got := buildSystemPromptText(cfg); strings.Contains(got, "Spawning Small Child Workers") {
+		t.Fatal("worker at max depth must not see the child spawn section")
+	}
+	cfg.Depth = 1
+	if got := buildSystemPromptText(cfg); !strings.Contains(got, "Spawning Small Child Workers") {
+		t.Fatal("worker below max depth should see the child spawn section")
+	}
+	cfg.Role = sessionPromptRoleOrchestrator
+	if got := buildSystemPromptText(cfg); strings.Contains(got, "Spawning Small Child Workers") {
+		t.Fatal("orchestrator prompt must not carry the worker section")
+	}
+}
+
+func TestBuildSystemPrompt_OrchestratorHasPipelineSectionNotOldMergeRule(t *testing.T) {
+	got := buildSystemPromptText(systemPromptConfig{
+		Role:    sessionPromptRoleOrchestrator,
+		Project: promptProject{ID: "mer", Name: "Mercury", Repo: "https://github.com/acme/mercury", DefaultBranch: "main", Path: "/repo/mercury"},
+	})
+	for _, want := range []string{
+		"## Pipeline",
+		fmt.Sprintf("%s -> %s -> %s -> %s", domain.PipelineStageBuilding, domain.PipelineStageValidating, domain.PipelineStageReview, strings.ToUpper(string(domain.PipelineStageReady))),
+		"Stages cannot be skipped",
+		"`ao pr merge <n>`",
+		"Never merge a task that is not READY",
+		"tell the user",
+		string(domain.PipelineStageEscalated),
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("orchestrator prompt missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Do not merge unless explicitly asked") {
+		t.Fatalf("orchestrator prompt still carries the old merge rule:\n%s", got)
+	}
+}
+
+func TestBuildSystemPrompt_WorkerNeverMerges(t *testing.T) {
+	got := buildSystemPromptText(systemPromptConfig{
+		Role:    sessionPromptRoleWorker,
+		Project: promptProject{ID: "mer", Name: "Mercury", Repo: "https://github.com/acme/mercury", DefaultBranch: "main", Path: "/repo/mercury"},
+	})
+	if !strings.Contains(got, "Never merge a PR yourself") {
+		t.Fatalf("worker prompt missing the never-merge line:\n%s", got)
+	}
+}
+
+func TestBuildSystemPrompt_OrchestratorHasWaitingAndParallelismGuidance(t *testing.T) {
+	orch := buildSystemPromptText(systemPromptConfig{
+		Role:    sessionPromptRoleOrchestrator,
+		Project: promptProject{ID: "mer", Name: "Mercury"},
+	})
+	worker := buildSystemPromptText(systemPromptConfig{
+		Role:    sessionPromptRoleWorker,
+		Project: promptProject{ID: "mer", Name: "Mercury"},
+	})
+	for _, want := range []string{
+		"## Waiting",
+		"Do not poll workers in a loop",
+		"Monitor or wait tool",
+		"## Parallelism",
+		"Run 2-3 workers at a time by default",
+		"tasks that share files run one after the other",
+		fmt.Sprintf("caps active workers at %d and active children per worker at %d", DefaultMaxActiveWorkers, DefaultMaxActiveChildren),
+		"Use `--tier fast` for small independent tasks",
+	} {
+		if !strings.Contains(orch, want) {
+			t.Errorf("orchestrator prompt missing %q", want)
+		}
+		if strings.Contains(worker, want) {
+			t.Errorf("worker prompt must not contain %q", want)
+		}
 	}
 }

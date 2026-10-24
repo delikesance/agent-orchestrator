@@ -42,6 +42,7 @@ import (
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
 	usagesvc "github.com/aoagents/agent-orchestrator/backend/internal/service/usage"
 	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 	"github.com/aoagents/agent-orchestrator/backend/internal/workspacewatch"
 )
 
@@ -202,6 +203,9 @@ type SessionsController struct {
 	AgentBrowserToken string
 	// ArtifactVersions serves artifact version history; nil leaves those routes unimplemented.
 	ArtifactVersions ArtifactVersionService
+	// Pipeline fills the read-only pipeline block of a session view; nil leaves
+	// every view without one.
+	Pipeline PipelineReader
 }
 
 // Register mounts the session routes on the supplied router.
@@ -300,7 +304,7 @@ func (c *SessionsController) list(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteError(w, r, err)
 		return
 	}
-	envelope.WriteJSON(w, http.StatusOK, ListSessionsResponse{Sessions: sessionViews(r, sessions)})
+	envelope.WriteJSON(w, http.StatusOK, ListSessionsResponse{Sessions: c.sessionViews(r, sessions)})
 }
 
 func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
@@ -336,6 +340,10 @@ func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "INVALID_REQUESTED_OUTPUT", "requestedOutput must be \"artifact\" or omitted", nil)
 		return
 	}
+	if in.Tier != "" && !in.Tier.Valid() {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "INVALID_TIER", "tier must be \"fast\", \"standard\", \"deep\" or omitted", nil)
+		return
+	}
 	if len(in.Prompt) > maxPromptLen {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "PROMPT_TOO_LONG", "Prompt must be 16 KiB or fewer", nil)
 		return
@@ -357,6 +365,26 @@ func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", attachErr.code, attachErr.message, nil)
 		return
 	}
+	// The parent id in the body is only a claim. A caller the daemon verified
+	// (X-AO-Session-Token) is the authority: a body naming another parent is a
+	// forged lineage, and a body naming none is filled in with the caller, so a
+	// raw HTTP spawn cannot launder a worker out of the mandatory pipeline (only
+	// a spawn with a parent is enrolled). An unverified caller keeps the legacy
+	// behaviour and the manager is told the claim is unproven.
+	caller := sessionauth.CallerFromContext(r.Context())
+	parentVerified := false
+	if caller.Verified && strings.TrimSpace(caller.SessionID) != "" {
+		switch {
+		case in.ParentSessionID != "" && string(in.ParentSessionID) != caller.SessionID:
+			envelope.WriteAPIError(w, r, http.StatusForbidden, "forbidden", "PARENT_SESSION_MISMATCH", "parentSessionId does not match the authenticated calling session", nil)
+			return
+		case in.ParentSessionID != "":
+			parentVerified = true
+		case in.Kind == domain.KindWorker:
+			in.ParentSessionID = domain.SessionID(caller.SessionID)
+			parentVerified = true
+		}
+	}
 	requestHash := ""
 	if in.ClientRequestID != "" {
 		keyless := in
@@ -364,12 +392,20 @@ func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
 		keyless.Attachments = nil
 		requestHash = clientRequestFingerprint("session", keyless, attachments)
 	}
-	sess, promptBytes, systemPromptBytes, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, ParentSessionID: in.ParentSessionID, TrackerProvider: in.TrackerProvider, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, RequestedMode: in.Mode, Prompt: in.Prompt, RequestedOutput: in.RequestedOutput, DisplayName: displayName, Attachments: attachments, AgentConfig: ports.AgentConfig{Model: in.Model, Effort: in.Effort, Permissions: in.ApprovalMode}, EffortOverride: strings.TrimSpace(in.Effort) != "", ClientRequestID: in.ClientRequestID, ClientRequestHash: requestHash})
+	sess, promptBytes, systemPromptBytes, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, ParentSessionID: in.ParentSessionID, ParentVerified: parentVerified, TrackerProvider: in.TrackerProvider, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, RequestedMode: in.Mode, Prompt: in.Prompt, RequestedOutput: in.RequestedOutput, Tier: in.Tier, DisplayName: displayName, Attachments: attachments, AgentConfig: ports.AgentConfig{Model: in.Model, Effort: in.Effort, Permissions: in.ApprovalMode}, EffortOverride: strings.TrimSpace(in.Effort) != "", ClientRequestID: in.ClientRequestID, ClientRequestHash: requestHash})
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return
 	}
-	envelope.WriteJSON(w, http.StatusCreated, SpawnSessionResponse{Session: sessionView(r, sess), PromptBytes: promptBytes, SystemPromptBytes: systemPromptBytes})
+	resp := SpawnSessionResponse{Session: c.sessionView(r, sess), PromptBytes: promptBytes, SystemPromptBytes: systemPromptBytes}
+	if in.Tier != "" {
+		applied := sess.TierApplied
+		resp.TierApplied = &applied
+		if sess.TierWarning != "" {
+			resp.Warnings = []string{sess.TierWarning}
+		}
+	}
+	envelope.WriteJSON(w, http.StatusCreated, resp)
 }
 
 // attachmentError carries a client-facing API error code + message for a
@@ -489,7 +525,7 @@ func (c *SessionsController) get(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteError(w, r, err)
 		return
 	}
-	envelope.WriteJSON(w, http.StatusOK, SessionResponse{Session: sessionView(r, sess)})
+	envelope.WriteJSON(w, http.StatusOK, SessionResponse{Session: c.sessionView(r, sess)})
 }
 
 func (c *SessionsController) preview(w http.ResponseWriter, r *http.Request) {
@@ -2232,6 +2268,10 @@ func (c *SessionsController) delegateTask(w http.ResponseWriter, r *http.Request
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_APPROVAL_MODE", "approvalMode is invalid", nil)
 		return
 	}
+	if in.Tier != "" && !in.Tier.Valid() {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "INVALID_TIER", "tier must be \"fast\", \"standard\", \"deep\" or omitted", nil)
+		return
+	}
 	attachments, attachErr := decodeSpawnAttachments(in.Attachments)
 	if attachErr != nil {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", attachErr.code, attachErr.message, nil)
@@ -2256,6 +2296,7 @@ func (c *SessionsController) delegateTask(w http.ResponseWriter, r *http.Request
 		Effort:            sanitizedOptionalString(in.Effort),
 		ApprovalMode:      in.ApprovalMode,
 		RequestedMode:     in.Mode,
+		Tier:              in.Tier,
 		Attachments:       attachments,
 		TaskPreparation:   domain.TaskPreparationToken(strings.TrimSpace(in.TaskPreparation)),
 	})
@@ -2611,7 +2652,7 @@ func (c *SessionsController) listOrchestrators(w http.ResponseWriter, r *http.Re
 		envelope.WriteError(w, r, err)
 		return
 	}
-	envelope.WriteJSON(w, http.StatusOK, ListSessionsResponse{Sessions: sessionViews(r, sessions)})
+	envelope.WriteJSON(w, http.StatusOK, ListSessionsResponse{Sessions: c.sessionViews(r, sessions)})
 }
 
 func (c *SessionsController) getOrchestrator(w http.ResponseWriter, r *http.Request) {
@@ -2628,7 +2669,7 @@ func (c *SessionsController) getOrchestrator(w http.ResponseWriter, r *http.Requ
 		envelope.WriteAPIError(w, r, http.StatusNotFound, "not_found", "SESSION_NOT_FOUND", "Unknown session", nil)
 		return
 	}
-	envelope.WriteJSON(w, http.StatusOK, SessionResponse{Session: sessionView(r, sess)})
+	envelope.WriteJSON(w, http.StatusOK, SessionResponse{Session: c.sessionView(r, sess)})
 }
 
 func sessionID(r *http.Request) domain.SessionID {
@@ -2641,7 +2682,10 @@ func orchestratorID(r *http.Request) domain.SessionID {
 
 func parseSessionListFilter(r *http.Request) (sessionsvc.ListFilter, error) {
 	q := r.URL.Query()
-	filter := sessionsvc.ListFilter{ProjectID: domain.ProjectID(q.Get("project"))}
+	filter := sessionsvc.ListFilter{
+		ProjectID:       domain.ProjectID(q.Get("project")),
+		ParentSessionID: domain.SessionID(q.Get("parentSessionId")),
+	}
 	if raw := q.Get("active"); raw != "" {
 		active, err := strconv.ParseBool(raw)
 		if err != nil {
@@ -2865,6 +2909,8 @@ func sessionView(r *http.Request, s domain.Session) SessionView {
 		PreviewURL:         s.Metadata.PreviewURL,
 		PreviewRevision:    s.Metadata.PreviewRevision,
 		Model:              s.Metadata.Model,
+		Tier:               s.Metadata.Tier,
+		Effort:             s.Metadata.Effort,
 		LastUserMessageAt: func() *time.Time {
 			if s.Metadata.LatestUserPromptAt.IsZero() {
 				return nil
@@ -2889,10 +2935,18 @@ func sessionView(r *http.Request, s domain.Session) SessionView {
 	return view
 }
 
-func sessionViews(r *http.Request, sessions []domain.Session) []SessionView {
+// sessionView is the package-level sessionView plus the pipeline block, which
+// needs the pipeline service. Legacy sessions never touch the service.
+func (c *SessionsController) sessionView(r *http.Request, s domain.Session) SessionView {
+	view := sessionView(r, s)
+	view.Pipeline = pipelineView(r.Context(), c.Pipeline, s)
+	return view
+}
+
+func (c *SessionsController) sessionViews(r *http.Request, sessions []domain.Session) []SessionView {
 	out := make([]SessionView, 0, len(sessions))
 	for _, s := range sessions {
-		out = append(out, sessionView(r, s))
+		out = append(out, c.sessionView(r, s))
 	}
 	return out
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/agentlaunch"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
 )
 
@@ -86,6 +87,10 @@ type LaunchSpec struct {
 	ReviewQueue            []ports.ReviewTask
 	ReviewIndex            int
 	InterfaceMode          domain.ReviewerInterfaceMode
+	// BranchTargets marks queued runs (by run id) that review a branch diff
+	// instead of a PR. Such runs have an empty PRURL; the prompt names the git
+	// diff to inspect from this target.
+	BranchTargets map[string]BranchTarget
 	// DeferInitialMessage starts the reviewer without dispatching its review
 	// prompt. The engine uses this while replacing a live reviewer so the old
 	// process can be stopped before the replacement receives executable work.
@@ -160,6 +165,9 @@ type agentLauncher struct {
 	auth       agentAuthResolver
 	executable func() (string, error)
 	chat       ReviewerChatController
+	// sessionSecret keys the AO_REVIEW_TOKEN a reviewer pane carries. Empty
+	// exports no token.
+	sessionSecret []byte
 }
 
 type preLaunchReviewer interface {
@@ -199,6 +207,13 @@ func WithExecutable(executable func() (string, error)) LauncherOption {
 	return func(l *agentLauncher) {
 		l.executable = executable
 	}
+}
+
+// WithSessionSecret keys the AO_REVIEW_TOKEN injected into reviewer panes and
+// chats: the proof the daemon requires on `ao review submit` for a pipeline
+// session. It is only ever exported to the reviewer, never to the worker.
+func WithSessionSecret(secret []byte) LauncherOption {
+	return func(l *agentLauncher) { l.sessionSecret = secret }
 }
 
 // WithRunFilePath pins reviewer-local AO CLI calls to this daemon's run-file.
@@ -425,7 +440,11 @@ func previousReviewHistoryText(runs []domain.ReviewRun) string {
 			fmt.Fprintf(&b, "\n* ... %d older review run(s) omitted.", len(runs)-maxRuns)
 			break
 		}
-		fmt.Fprintf(&b, "\n* %s", run.PRURL)
+		if IsBranchRun(run) {
+			b.WriteString("\n* branch-diff review")
+		} else {
+			fmt.Fprintf(&b, "\n* %s", run.PRURL)
+		}
 		if run.TargetSHA != "" {
 			fmt.Fprintf(&b, " at %s", run.TargetSHA)
 		}
@@ -663,6 +682,14 @@ func outputContainsAny(output string, patterns []string) bool {
 func (l *agentLauncher) runtimeEnv(ctx context.Context, spec LaunchSpec, argv []string, base map[string]string) map[string]string {
 	env := agentlaunch.MergeEnv(spec.ProjectEnv, base)
 	delete(env, sessionmanager.EnvSessionID)
+	// A reviewer is not the worker: it must not inherit a session token, and a
+	// project cannot hand it a review token. The review token is last-wins and
+	// keyed on the review row, so it covers every run of that worker's review.
+	delete(env, sessionmanager.EnvSessionToken)
+	delete(env, sessionauth.EnvReviewToken)
+	if token := sessionauth.IssueReview(l.sessionSecret, spec.ReviewSessionID); token != "" {
+		env[sessionauth.EnvReviewToken] = token
+	}
 	env["AO_REVIEW_SESSION_ID"] = spec.ReviewSessionID
 	env["AO_REVIEW_WORKER_SESSION_ID"] = string(spec.WorkerID)
 	env["AO_REVIEW_HARNESS"] = string(spec.Harness)

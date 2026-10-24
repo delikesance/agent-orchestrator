@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
 type sessionPromptRole string
@@ -40,6 +42,9 @@ type systemPromptConfig struct {
 	ProjectRules          string
 	OrchestratorRules     string
 	AdditionalSections    []string
+	// Depth is the session's spawn depth (orchestrator = 0). Zero means
+	// unknown; the worker spawn section then depends on the constant only.
+	Depth int
 }
 
 type projectRulesConfig struct {
@@ -75,7 +80,7 @@ func buildSystemPromptText(cfg systemPromptConfig) string {
 	sections := make([]string, 0, 6)
 	switch cfg.Role {
 	case sessionPromptRoleOrchestrator:
-		sections = append(sections, orchestratorSystemPrompt(cfg.Project))
+		sections = append(sections, orchestratorSystemPrompt(cfg.Project), orchestratorPipelinePrompt(), orchestratorWaitingPrompt(), orchestratorParallelismPrompt())
 		if rules := strings.TrimSpace(cfg.OrchestratorRules); rules != "" {
 			sections = append(sections, "## Project-Specific Orchestrator Rules\n"+rules)
 		}
@@ -91,6 +96,9 @@ func buildSystemPromptText(cfg systemPromptConfig) string {
 		}
 		if strings.TrimSpace(cfg.Project.Repo) != "" {
 			sections = append(sections, workerNativeReviewPrompt(cfg.Project, orchestratorID != ""))
+		}
+		if section := workerChildSpawnPrompt(cfg.Depth); section != "" {
+			sections = append(sections, section)
 		}
 		sections = append(sections, workerMultiPRPrompt(), workerContainerLabelPrompt(), workerGitIsolationPrompt())
 		if rules := strings.TrimSpace(cfg.ProjectRules); rules != "" {
@@ -242,6 +250,7 @@ Your job is to coordinate work, not to perform implementation. Keep the project 
 - Before running `+"`ao spawn`"+`, count the `+"`--name`"+` label yourself. It must be 100 characters or fewer. If your first label is longer, shorten it before executing the command.
 - Add `+"`--agent <name>`"+` when a worker must use a specific agent.
 - Add `+"`--model <id>`"+` when the human or task explicitly requests a specific model.
+- Add `+"`--tier fast`"+` for small, cheap tasks (renames, doc tweaks, simple lookups); `+"`--tier deep`"+` for hard ones. An explicit `+"`--model`"+` or `+"`--effort`"+` always wins over the tier.
 - Never drop an explicitly requested `+"`--model`"+` or substitute another model automatically. If `+"`ao spawn --model ...`"+` fails because the model is unsupported, report the error and ask the human to choose an alternative; model access, credits, and cost may differ.
 - `+"`ao send --session <session-id> --message \"<message>\"`"+` - message a worker.
 - `+"`ao session claim-pr <worker-session-id> <pr-ref>`"+` - attach an existing PR for authorized implementation continuation to a worker session. Never use it for review-only work. Orchestrators must pass the target worker session explicitly; never rely on the orchestrator's own `+"`AO_SESSION_ID`"+`.
@@ -271,10 +280,44 @@ Your job is to coordinate work, not to perform implementation. Keep the project 
 
 - If CI fails, send the failing output to the responsible worker and ask them to fix and push.
 - If review changes are requested on an AO worker's implementation PR, send the review findings to that implementation worker. A review-only session does not take ownership of the target PR or perform fix-work follow-up.
-- If work is green and approved, report that state to the human. Do not merge unless explicitly asked and supported by project rules.
+- If work is green and approved, report that state to the human. Merging is governed by the Pipeline section below.
 - An AO review approval is internal. It is not a GitHub approval and does not satisfy required or independent-account reviews or branch protection; report what is still required instead of working around it.
 
 %s`, projectName(project), project.ID, project.ID, project.ID, projectContextSection(project))
+}
+
+// orchestratorPipelinePrompt describes the mandatory delivery pipeline. Stage
+// names come from the domain constants so the prompt cannot drift from them.
+func orchestratorPipelinePrompt() string {
+	building, validating, review := domain.PipelineStageBuilding, domain.PipelineStageValidating, domain.PipelineStageReview
+	ready, escalated := domain.PipelineStageReady, domain.PipelineStageEscalated
+	return fmt.Sprintf(`## Pipeline
+
+Every task you spawn moves through %[1]s -> %[2]s -> %[3]s -> %[4]s. Stages cannot be skipped. The daemon drives validation and review; you do not run them.
+
+- Merge only %[4]s tasks, with `+"`ao pr merge <n>`"+`. Never merge a task that is not %[4]s, and do not ask a worker to merge.
+- When a %[4]s nudge arrives, merge that task.
+- Read a task's stage with `+"`ao session get <worker-session-id>`"+`.
+- When a task reaches %[5]s, tell the user; the daemon has stopped working on it.`, building, validating, review, strings.ToUpper(string(ready)), escalated)
+}
+
+// orchestratorWaitingPrompt and orchestratorParallelismPrompt guide how the
+// orchestrator waits on and sizes its worker fleet. Daemon caps come from the
+// spawn limit constants so the text cannot drift from them.
+func orchestratorWaitingPrompt() string {
+	return `## Waiting
+
+- Do not poll workers in a loop. Daemon notices (task ready, validation failed, review changes requested, escalated, child report) already arrive as messages.
+- If you have a Monitor or wait tool, use it instead of repeated polling; otherwise check state only when a notice arrives or at a long interval.`
+}
+
+func orchestratorParallelismPrompt() string {
+	return fmt.Sprintf(`## Parallelism
+
+- Run 2-3 workers at a time by default; add more only while you can still review their results.
+- Independent tasks go in parallel; tasks that share files run one after the other.
+- The daemon caps active workers at %d and active children per worker at %d; do not plan beyond them.
+- Use `+"`--tier fast`"+` for small independent tasks and the default tier otherwise.`, DefaultMaxActiveWorkers, DefaultMaxActiveChildren)
 }
 
 func workerSystemPrompt(project promptProject, hasOrchestrator bool) string {
@@ -318,6 +361,7 @@ Your job is to complete the assigned task in this workspace. For implementation,
 ## Session Lifecycle
 
 - Focus on the assigned task only.
+- Never merge a PR yourself. Report `+"`ao report --done`"+` and let the orchestrator merge once the task is ready.
 - Do not take unrelated work or perform broad refactors.
 - If you are continuing implementation, CI recovery, review-comment follow-up, or other explicitly authorized work that continues or changes an existing PR, claim or attach it through AO before changing it when the workflow supports that. From this worker, use `+"`ao session claim-pr <pr-ref>`"+`; `+"`AO_SESSION_ID`"+` selects this session automatically. Never claim or attach a PR for a review-only task.
 - For implementation work, if CI fails, fix the failures and push again.
@@ -357,6 +401,24 @@ Use `+"`ao report`"+` to persist meaningful progress for the active project orch
 %s
 
 %s`, taskSourceRules, parallelHelpRules, repoRules, projectContextSection(project))
+}
+
+// workerChildSpawnPrompt is the opt-in nested-spawn section for workers. It is
+// empty unless nested spawning is enabled and this worker is below the depth
+// cap. depth 0 means the caller does not know the depth (workers are always at
+// depth >= 1), so only the constant gates the section.
+func workerChildSpawnPrompt(depth int) string {
+	if DefaultMaxSpawnDepth < 2 || (depth > 0 && depth >= DefaultMaxSpawnDepth) {
+		return ""
+	}
+	return fmt.Sprintf(`## Spawning Small Child Workers (Optional)
+
+Split work only when a piece is truly independent and tiny; otherwise do it yourself.
+
+- Spawn a child with `+"`ao spawn --tier fast --prompt \"<clear task>\" --name \"<label>\"`"+`. `+"`AO_SESSION_ID`"+` makes this session the parent, and the child branches from the project base branch.
+- A child may not use a higher tier than yours.
+- Caps: at most %d live children per parent, %d live workers per project, and nesting depth at most %d (orchestrator = 0). A refused spawn prints the reason; do not retry around it.
+- Children report back with `+"`ao report`"+`. You integrate their work by merging the child branch yourself; list children with `+"`ao session ls --children`"+`.`, DefaultMaxActiveChildren, DefaultMaxActiveWorkers, DefaultMaxSpawnDepth)
 }
 
 // workerNativeReviewPrompt teaches a worker AO's native reviewer. The project

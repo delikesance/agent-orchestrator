@@ -1318,6 +1318,7 @@ function notificationIcon(type: string) {
 			return MessageSquareDiff;
 		case "ready_to_merge":
 			return GitPullRequestArrow;
+		case "pipeline_escalated":
 		case "agent_failed":
 			return CircleAlert;
 		case "agent_completed":
@@ -1341,6 +1342,7 @@ function notificationIconClass(type: string): string {
 		case "needs_input":
 		case "review_feedback":
 			return "text-warning";
+		case "pipeline_escalated":
 		case "agent_failed":
 			return "text-error";
 		case "agent_completed":

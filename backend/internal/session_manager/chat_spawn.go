@@ -144,6 +144,7 @@ func (m *Manager) runRecordBackgroundTask(ctx context.Context, rec domain.Sessio
 	// This provider call is not the worker session. Suppress session-scoped hooks
 	// so its prompt and response cannot be projected into the worker's history.
 	deleteProtectedEnv(env, EnvSessionID, envKeysCaseInsensitive)
+	deleteProtectedEnv(env, EnvSessionToken, envKeysCaseInsensitive)
 	pinRuntimePermissionEnv(env, config.Permissions)
 
 	return run(ctx, rec.Harness, ports.ChatStartConfig{
@@ -275,6 +276,7 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		ControllerReady: func(started ChatStarted) (ChatControllerCommit, error) {
 			metadata := domain.SessionMetadata{
 				Permissions:       in.record.Metadata.Permissions,
+				Tier:              in.record.Metadata.Tier,
 				Branch:            in.workspace.Branch,
 				WorkspacePath:     in.workspace.Path,
 				WorkspaceRepoPath: in.workspace.RepoPath,
@@ -361,8 +363,8 @@ func (m *Manager) aoMCPServers(harness domain.AgentHarness, env map[string]strin
 	}
 	// AO_DATA_DIR too: a harness may start the server with exactly this env, and
 	// without it config.Load needs $HOME to find the data dir.
-	serverEnv := make(map[string]string, 3)
-	for _, key := range []string{EnvSessionID, EnvRunFile, EnvDataDir} {
+	serverEnv := make(map[string]string, 4)
+	for _, key := range []string{EnvSessionID, EnvSessionToken, EnvRunFile, EnvDataDir} {
 		if value := env[key]; value != "" {
 			serverEnv[key] = value
 		}

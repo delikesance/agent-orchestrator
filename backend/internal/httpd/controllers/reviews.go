@@ -14,6 +14,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	reviewcore "github.com/aoagents/agent-orchestrator/backend/internal/review"
 	reviewsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/review"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 )
 
 // ListReviewsResponse is the body of GET /api/v1/sessions/{sessionId}/reviews.
@@ -196,6 +197,11 @@ func (c *ReviewsController) trigger(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_JSON", "Invalid JSON body", nil)
 		return
 	}
+	target := reviewcore.ReviewTargetKind(strings.TrimSpace(in.Target))
+	if target != "" && !target.Valid() {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_REVIEW_TARGET", "Review target must be \"pr\" or \"branch\"", nil)
+		return
+	}
 	res, err := c.Svc.TriggerRequested(r.Context(), sessionID(r), reviewsvc.TriggerRequest{
 		Harness:            in.Harness,
 		Config:             in.AgentConfig,
@@ -205,6 +211,7 @@ func (c *ReviewsController) trigger(w http.ResponseWriter, r *http.Request) {
 		RejectReviewedHead: in.RejectReviewedHead,
 		Rerun:              in.Rerun,
 		EnableAutoInject:   in.EnableAutoInject,
+		Target:             target,
 	})
 	if err != nil {
 		writeReviewError(w, r, err)
@@ -417,7 +424,15 @@ func (c *ReviewsController) submit(w http.ResponseWriter, r *http.Request) {
 			GithubReviewID: in.GithubReviewID,
 		})
 	}
-	runs, err := c.Svc.SubmitMany(r.Context(), sessionID(r), reviews)
+	// Who is submitting decides whether the verdict may count: the service
+	// refuses the worker itself and, for pipeline sessions, a caller without the
+	// reviewer's review token (see service/review submit_auth.go).
+	caller := sessionauth.CallerFromContext(r.Context())
+	ctx := reviewsvc.WithSubmitAuth(r.Context(), reviewsvc.SubmitAuth{
+		CallerSessionID: caller.SessionID,
+		ReviewToken:     strings.TrimSpace(r.Header.Get(sessionauth.HeaderReviewToken)),
+	})
+	runs, err := c.Svc.SubmitMany(ctx, sessionID(r), reviews)
 	if err != nil {
 		writeReviewError(w, r, err)
 		return
@@ -435,6 +450,8 @@ func writeReviewError(w http.ResponseWriter, r *http.Request, err error) {
 		envelope.WriteAPIError(w, r, http.StatusUnprocessableEntity, "unprocessable", "REVIEW_INVALID", err.Error(), nil)
 	case errors.Is(err, reviewsvc.ErrNotFound):
 		envelope.WriteAPIError(w, r, http.StatusNotFound, "not_found", "REVIEW_NOT_FOUND", err.Error(), nil)
+	case errors.Is(err, reviewsvc.ErrSubmitForbidden):
+		envelope.WriteAPIError(w, r, http.StatusForbidden, "forbidden", "REVIEW_SUBMIT_FORBIDDEN", err.Error(), nil)
 	case errors.Is(err, reviewsvc.ErrReviewAlreadyRunning):
 		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "REVIEW_ALREADY_RUNNING", err.Error(), nil)
 	case errors.Is(err, reviewsvc.ErrHeadAlreadyReviewed):

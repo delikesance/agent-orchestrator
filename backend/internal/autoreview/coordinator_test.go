@@ -62,6 +62,12 @@ func TestEvaluateSessionEligibility(t *testing.T) {
 		{name: "waiting input", mutate: func(f *fakeStore) { f.session.Activity.State = domain.ActivityWaitingInput }},
 		{name: "blocked", mutate: func(f *fakeStore) { f.session.Activity.State = domain.ActivityBlocked }},
 		{name: "terminated", mutate: func(f *fakeStore) { f.session.IsTerminated = true }},
+		{name: "pipeline session at building is left to the pipeline", mutate: func(f *fakeStore) { f.session.PipelineStage = domain.PipelineStageBuilding }},
+		{name: "pipeline session at review is left to the pipeline", mutate: func(f *fakeStore) { f.session.PipelineStage = domain.PipelineStageReview }},
+		{name: "pipeline session with pipeline off is still swept", want: true, mutate: func(f *fakeStore) {
+			f.session.PipelineStage = domain.PipelineStageReview
+			f.project.Config.Pipeline.Enforce = domain.PipelineEnforceOff
+		}},
 		{name: "draft", want: true, mutate: func(f *fakeStore) { f.prs[0].Draft = true }},
 		{name: "closed", mutate: func(f *fakeStore) { f.prs[0].Closed = true }},
 		{name: "merged", mutate: func(f *fakeStore) { f.prs[0].Merged = true }},
@@ -294,4 +300,19 @@ func TestCoordinatorPeriodicallyEvaluatesPersistedFacts(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+func TestSweepRunsHooksAfterTheSessionPassAndIsolatesTheirErrors(t *testing.T) {
+	store := &fakeStore{session: domain.SessionRecord{ID: "s1", Kind: domain.KindWorker}}
+	var order []string
+	failing := func(context.Context) error { order = append(order, "failing"); return context.DeadlineExceeded }
+	counting := func(context.Context) error { order = append(order, "counting"); return nil }
+	c := New(store, &fakeTrigger{}, Config{SweepHooks: []SweepHook{failing, nil, counting}})
+
+	if err := c.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep returned %v; a hook error must not fail the sweep", err)
+	}
+	if len(order) != 2 || order[0] != "failing" || order[1] != "counting" {
+		t.Fatalf("hooks ran %v, want failing then counting despite the first error", order)
+	}
 }

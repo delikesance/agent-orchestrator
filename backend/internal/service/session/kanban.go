@@ -35,6 +35,7 @@ func toContractKanbanSessionFacts(rec domain.SessionRecord, interrupted, signalC
 		AutoReview:        rec.AutoReviewEnabled,
 		AutoInjectReview:  rec.AutoInjectReview,
 		AutoInjectCI:      rec.AutoInjectCI,
+		PipelineStage:     string(rec.PipelineStage),
 	}
 }
 

@@ -97,7 +97,10 @@ type fakeSessionService struct {
 	workspaceViewHistory       *sessionsvc.WorkspaceHistory
 	workspaceBranches          sessionsvc.WorkspaceBranches
 	spawnErr                   error
-	lastSpawn                  ports.SpawnConfig
+	lastListFilter             sessionsvc.ListFilter
+	lastSpawn                 ports.SpawnConfig
+	tierApplied                bool
+	tierWarning                string
 	orchestratorMode           domain.SessionMode
 	orchestratorApproval       domain.PermissionMode
 	claimErr                   error
@@ -248,8 +251,12 @@ func newFakeSessionService() *fakeSessionService {
 
 func (f *fakeSessionService) List(_ context.Context, filter sessionsvc.ListFilter) ([]domain.Session, error) {
 	var out []domain.Session
+	f.lastListFilter = filter
 	for _, s := range f.sessions {
 		if filter.ProjectID != "" && s.ProjectID != filter.ProjectID {
+			continue
+		}
+		if filter.ParentSessionID != "" && s.ParentSessionID != filter.ParentSessionID {
 			continue
 		}
 		if filter.Active != nil && s.IsTerminated == *filter.Active {
@@ -269,7 +276,7 @@ func (f *fakeSessionService) Spawn(_ context.Context, cfg ports.SpawnConfig) (do
 		return domain.Session{}, 0, 0, f.spawnErr
 	}
 	now := time.Now().UTC()
-	s := domain.Session{SessionRecord: domain.SessionRecord{ID: domain.SessionID(string(cfg.ProjectID) + "-2"), ProjectID: cfg.ProjectID, IssueID: cfg.IssueID, Kind: cfg.Kind, Harness: cfg.Harness, DisplayName: cfg.DisplayName, Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}, AutoInjectReview: true, AutoInjectCI: true, CreatedAt: now, UpdatedAt: now}, Status: domain.StatusIdle}
+	s := domain.Session{SessionRecord: domain.SessionRecord{ID: domain.SessionID(string(cfg.ProjectID) + "-2"), ProjectID: cfg.ProjectID, IssueID: cfg.IssueID, Kind: cfg.Kind, Harness: cfg.Harness, DisplayName: cfg.DisplayName, Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}, AutoInjectReview: true, AutoInjectCI: true, CreatedAt: now, UpdatedAt: now, TierApplied: f.tierApplied, TierWarning: f.tierWarning}, Status: domain.StatusIdle}
 	f.sessions[s.ID] = s
 	return s, len(cfg.Prompt), 0, nil
 }
@@ -1780,6 +1787,146 @@ func TestSessionsAPI_SpawnRejectsUnknownExplicitMode(t *testing.T) {
 	assertErrorCode(t, body, status, http.StatusBadRequest, "SESSION_MODE_INVALID")
 	if len(svc.sessions) != 1 {
 		t.Fatalf("invalid mode created a session: %#v", svc.sessions)
+	}
+}
+
+func TestSessionsAPI_SpawnPassesTierToConfig(t *testing.T) {
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+
+	body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions",
+		`{"projectId":"ao","harness":"codex","prompt":"fix","tier":"deep"}`)
+	if status != http.StatusCreated {
+		t.Fatalf("spawn with tier = %d, want 201; body=%s", status, body)
+	}
+	if svc.lastSpawn.Tier != domain.TierDeep {
+		t.Fatalf("spawn tier = %q, want %q", svc.lastSpawn.Tier, domain.TierDeep)
+	}
+}
+
+func TestSessionsAPI_SpawnReportsTierOutcomeOnlyWhenRequested(t *testing.T) {
+	svc := newFakeSessionService()
+	svc.tierApplied = true
+	svc.tierWarning = "tier fast: no catalog model"
+	srv := newSessionTestServer(t, svc)
+
+	body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions",
+		`{"projectId":"ao","harness":"codex","prompt":"fix","tier":"fast"}`)
+	if status != http.StatusCreated {
+		t.Fatalf("spawn with tier = %d, want 201; body=%s", status, body)
+	}
+	var withTier struct {
+		TierApplied bool     `json:"tierApplied"`
+		Warnings    []string `json:"warnings"`
+	}
+	mustJSON(t, body, &withTier)
+	if !withTier.TierApplied || len(withTier.Warnings) != 1 || withTier.Warnings[0] != svc.tierWarning {
+		t.Fatalf("tier outcome = %+v, want applied with the warning; body=%s", withTier, body)
+	}
+
+	body, status, _ = doRequest(t, srv, http.MethodPost, "/api/v1/sessions",
+		`{"projectId":"ao","harness":"codex","prompt":"fix"}`)
+	if status != http.StatusCreated {
+		t.Fatalf("spawn without tier = %d, want 201; body=%s", status, body)
+	}
+	var raw map[string]any
+	mustJSON(t, body, &raw)
+	if _, ok := raw["tierApplied"]; ok {
+		t.Fatalf("tierApplied present without a requested tier: %s", body)
+	}
+	if _, ok := raw["warnings"]; ok {
+		t.Fatalf("warnings present without a requested tier: %s", body)
+	}
+
+	svc.tierApplied = false
+	body, status, _ = doRequest(t, srv, http.MethodPost, "/api/v1/sessions",
+		`{"projectId":"ao","harness":"codex","prompt":"fix","tier":"fast"}`)
+	if status != http.StatusCreated {
+		t.Fatalf("spawn with unapplied tier = %d, want 201; body=%s", status, body)
+	}
+	raw = nil
+	mustJSON(t, body, &raw)
+	if applied, ok := raw["tierApplied"]; !ok || applied != false {
+		t.Fatalf("tierApplied = %v (present=%v), want present false; body=%s", applied, ok, body)
+	}
+	var unapplied struct {
+		Warnings []string `json:"warnings"`
+	}
+	mustJSON(t, body, &unapplied)
+	if len(unapplied.Warnings) != 1 || unapplied.Warnings[0] != svc.tierWarning {
+		t.Fatalf("warnings = %v, want the tier warning; body=%s", unapplied.Warnings, body)
+	}
+}
+
+func TestSessionsAPI_SpawnGuardrailErrorsAre409(t *testing.T) {
+	for _, code := range []string{"SPAWN_DEPTH_EXCEEDED", "TOO_MANY_CHILDREN", "TOO_MANY_WORKERS", "TIER_EXCEEDS_PARENT", "INVALID_PARENT"} {
+		t.Run(code, func(t *testing.T) {
+			svc := newFakeSessionService()
+			svc.spawnErr = apierr.Conflict(code, "limit reached: 4 active, max 4", nil)
+			srv := newSessionTestServer(t, svc)
+			body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions",
+				`{"projectId":"ao","harness":"codex","prompt":"fix"}`)
+			assertErrorCode(t, body, status, http.StatusConflict, code)
+		})
+	}
+}
+
+func TestSessionsAPI_ListFiltersByParentSessionID(t *testing.T) {
+	svc := newFakeSessionService()
+	svc.sessions["ao-parent"] = domain.Session{SessionRecord: domain.SessionRecord{ID: "ao-parent", ProjectID: "ao", Kind: domain.KindWorker}}
+	svc.sessions["ao-kid"] = domain.Session{SessionRecord: domain.SessionRecord{ID: "ao-kid", ProjectID: "ao", Kind: domain.KindWorker, ParentSessionID: "ao-parent", Depth: 1}}
+	svc.sessions["ao-other"] = domain.Session{SessionRecord: domain.SessionRecord{ID: "ao-other", ProjectID: "ao", Kind: domain.KindWorker}}
+	srv := newSessionTestServer(t, svc)
+
+	ids := func(path string) []string {
+		body, status, _ := doRequest(t, srv, http.MethodGet, path, "")
+		if status != http.StatusOK {
+			t.Fatalf("GET %s = %d; body=%s", path, status, body)
+		}
+		var got struct {
+			Sessions []struct {
+				ID string `json:"id"`
+			} `json:"sessions"`
+		}
+		mustJSON(t, body, &got)
+		out := make([]string, 0, len(got.Sessions))
+		for _, g := range got.Sessions {
+			out = append(out, g.ID)
+		}
+		return out
+	}
+	if got := ids("/api/v1/sessions?parentSessionId=ao-parent"); len(got) != 1 || got[0] != "ao-kid" {
+		t.Fatalf("filtered ids = %v, want [ao-kid]", got)
+	}
+	if svc.lastListFilter.ParentSessionID != "ao-parent" {
+		t.Fatalf("filter = %#v", svc.lastListFilter)
+	}
+	if got := ids("/api/v1/sessions"); len(got) != 4 {
+		t.Fatalf("unfiltered ids = %v, want 4", got)
+	}
+}
+
+func TestSessionsAPI_DelegateRejectsInvalidTier(t *testing.T) {
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+
+	body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/orchestrators/delegate",
+		`{"projectId":"ao","brief":"Fix it","tier":"turbo"}`)
+	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_TIER")
+	if svc.delegationInput.ProjectID != "" {
+		t.Fatalf("invalid tier reached the delegate service: %#v", svc.delegationInput)
+	}
+}
+
+func TestSessionsAPI_SpawnRejectsInvalidTier(t *testing.T) {
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+
+	body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions",
+		`{"projectId":"ao","harness":"codex","prompt":"fix","tier":"turbo"}`)
+	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_TIER")
+	if len(svc.sessions) != 1 {
+		t.Fatalf("invalid tier created a session: %#v", svc.sessions)
 	}
 }
 

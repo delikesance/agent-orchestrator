@@ -33,6 +33,7 @@ type DelegateTaskInput struct {
 	Model             string
 	Effort            *string
 	ApprovalMode      domain.PermissionMode
+	Tier              domain.WorkerTier
 	RequestedMode     domain.SessionMode
 	Attachments       []ports.SpawnAttachment
 	TaskPreparation   domain.TaskPreparationToken
@@ -103,6 +104,7 @@ func (s *Service) DelegateTask(ctx context.Context, in DelegateTaskInput) (Deleg
 			Permissions: in.ApprovalMode,
 		},
 		EffortOverride: effortOverride,
+		Tier:           in.Tier,
 		RequestedMode:  in.RequestedMode,
 		Attachments:    in.Attachments,
 		// This is the desktop's new-task path: there is a UI waiting to navigate

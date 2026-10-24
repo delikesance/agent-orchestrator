@@ -126,6 +126,19 @@ type sessionTerminator interface {
 	Kill(ctx context.Context, id domain.SessionID) (bool, error)
 }
 
+// terminationObserver is the narrow port to Session Manager's end-of-session
+// hook (child cascade and parent report). It is late-bound for the same reason
+// as completionTerminator: Session Manager depends on this package.
+type terminationObserver interface {
+	OnSessionTerminated(ctx context.Context, id domain.SessionID)
+}
+
+// pipelineObserver is the narrow port to the mandatory delivery pipeline's PR
+// facts hook. It must not block: the pipeline runs its work off this goroutine.
+type pipelineObserver interface {
+	OnPRObservation(id domain.SessionID, o ports.PRObservation)
+}
+
 type sessionUsageFinalizer interface {
 	FinalizeSession(
 		ctx context.Context,
@@ -159,6 +172,21 @@ func WithNotificationSink(sink notificationSink) Option {
 // WithTelemetry wires lifecycle activity transitions to the shared telemetry sink.
 func WithTelemetry(sink ports.EventSink) Option {
 	return func(m *Manager) { m.telemetry = sink }
+}
+
+// WithLogger routes lifecycle diagnostics (the spawn first-signal timing line)
+// through the daemon logger so they reach daemon.log; without it they go to
+// slog.Default.
+func WithLogger(l *slog.Logger) Option {
+	return func(m *Manager) { m.logger = l }
+}
+
+// log is the injected logger, or slog.Default when none was wired.
+func (m *Manager) log() *slog.Logger {
+	if m.logger != nil {
+		return m.logger
+	}
+	return slog.Default()
 }
 
 // WithDataDir supplies AO's data directory so ReconcileSessionOutputType can
@@ -229,6 +257,12 @@ type Manager struct {
 	// completionTerminator is late-bound because Session Manager itself depends
 	// on this lifecycle reducer. It is required before the SCM observer starts.
 	completionTerminator sessionTerminator
+	// terminationObserver fires once per session, on the transition to
+	// terminated only (never on an already-terminated no-op).
+	terminationObserver terminationObserver
+	// pipelineObserver sees every fetched PR observation (head moves, CI
+	// settling, merges). It is best-effort and late-bound by the daemon.
+	pipelineObserver pipelineObserver
 	// usageFinalizer is late-bound because the usage pipeline is optional. It
 	// receives terminal intent before is_terminated makes the session ineligible
 	// for normal source discovery.
@@ -241,6 +275,9 @@ type Manager struct {
 	// dataDir backs ReconcileSessionOutputType's artifact-dir fallback for
 	// sessions rows created before session_output_type/artifact_dir existed.
 	dataDir string
+	// logger receives lifecycle diagnostics that must land in the daemon log
+	// (spawn: first signal). Nil falls back to slog.Default via log().
+	logger *slog.Logger
 
 	mu        sync.Mutex
 	window    time.Duration
@@ -250,6 +287,11 @@ type Manager struct {
 	// flights tracks, per session, the in-flight tool executions and the
 	// pending permission dialog's identity (see toolFlight). Guarded by mu.
 	flights map[domain.SessionID]*toolFlight
+	// launchedAt is when MarkSpawned last committed a launch (fresh or restore)
+	// whose first signal is still pending, so the spawn-timing log measures from
+	// the launch and never spans the session's whole life. In-memory only; cleared
+	// at the first signal and on termination.
+	launchedAt map[domain.SessionID]time.Time
 	// steps is each session's recent tool calls for the memory window, from
 	// tool-use hooks (see steps.go). Guarded by mu.
 	steps map[domain.SessionID][]domain.SessionStep
@@ -286,6 +328,7 @@ func New(store sessionStore, messenger ports.AgentMessenger, opts ...Option) *Ma
 		clock:                       clock,
 		react:                       newReactionState(),
 		flights:                     map[domain.SessionID]*toolFlight{},
+		launchedAt:                  map[domain.SessionID]time.Time{},
 		steps:                       map[domain.SessionID][]domain.SessionStep{},
 		pendingLaunches:             map[domain.SessionID]pendingLaunch{},
 		steerActive:                 func(domain.AgentHarness) bool { return false },
@@ -310,6 +353,38 @@ func (m *Manager) SetCompletionTerminator(terminator sessionTerminator) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.completionTerminator = terminator
+}
+
+// SetTerminationObserver wires the once-per-session end-of-session hook.
+func (m *Manager) SetTerminationObserver(observer terminationObserver) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.terminationObserver = observer
+}
+
+// SetPipelineObserver wires the delivery pipeline's PR facts hook.
+func (m *Manager) SetPipelineObserver(observer pipelineObserver) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pipelineObserver = observer
+}
+
+func (m *Manager) notifyPipeline(id domain.SessionID, o ports.PRObservation) {
+	m.mu.Lock()
+	observer := m.pipelineObserver
+	m.mu.Unlock()
+	if observer != nil {
+		observer.OnPRObservation(id, o)
+	}
+}
+
+func (m *Manager) notifyTerminated(ctx context.Context, id domain.SessionID) {
+	m.mu.Lock()
+	observer := m.terminationObserver
+	m.mu.Unlock()
+	if observer != nil {
+		observer.OnSessionTerminated(ctx, id)
+	}
 }
 
 // SetUsageFinalizer wires termination and relaunches to usage collection.
@@ -506,6 +581,7 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 		// m.mu — mutate holds it across this callback.
 		delete(m.flights, id)
 		delete(m.steps, id)
+		delete(m.launchedAt, id)
 		terminated = true
 		return next, true
 	})
@@ -518,6 +594,7 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 		// runtime reaper must not leave the session's Docker containers behind
 		// just because it never called MarkTerminated directly.
 		m.reapSessionContainers(ctx, id)
+		m.notifyTerminated(ctx, id)
 	}
 	return nil
 }
@@ -635,6 +712,7 @@ retryProjection:
 	if rec.IsTerminated {
 		delete(m.flights, id)
 		delete(m.steps, id)
+		delete(m.launchedAt, id)
 		m.mu.Unlock()
 		return nil
 	}
@@ -1022,7 +1100,8 @@ retryProjection:
 	}
 	next := rec
 	next.Activity = act
-	if next.FirstSignalAt.IsZero() {
+	firstSignal := next.FirstSignalAt.IsZero()
+	if firstSignal {
 		next.FirstSignalAt = timeOr(s.Timestamp, now)
 	}
 	if s.State == domain.ActivityExited {
@@ -1045,6 +1124,17 @@ retryProjection:
 		m.mu.Unlock()
 		return nil
 	}
+	var firstSignalAttrs []any
+	if firstSignal {
+		firstSignalAttrs = []any{"sessionID", id, "harness", rec.Harness}
+		if at, ok := m.launchedAt[id]; ok {
+			delete(m.launchedAt, id)
+			firstSignalAttrs = append(firstSignalAttrs, "first_signal_ms", next.FirstSignalAt.Sub(at).Milliseconds())
+		} else {
+			// Daemon restarted since the launch, or a legacy row: no honest delta.
+			firstSignalAttrs = append(firstSignalAttrs, "first_signal_ms_unknown", true)
+		}
+	}
 	// Transition into the needs-input family (waiting_input or blocked) pings
 	// the user; an in-family escalation (waiting_input -> blocked) does not
 	// re-notify — the user was already pinged once for this pause.
@@ -1062,6 +1152,9 @@ retryProjection:
 	resolutions := needsInputResolutions(rec, next, now)
 	waitingEvents := m.waitingInputEvents(next, prevState, prevAt, now)
 	m.mu.Unlock()
+	if firstSignalAttrs != nil {
+		m.log().Info("spawn: first signal", firstSignalAttrs...)
+	}
 	if prevState != domain.ActivityIdle && next.Activity.State == domain.ActivityIdle {
 		m.operationGateMu.RLock()
 		gate := m.operationGate
@@ -1545,6 +1638,8 @@ func (m *Manager) markSpawned(
 				return nil, err
 			}
 		}
+		// Only after the durable write succeeded, so a failed launch leaves no entry.
+		m.launchedAt[id] = now
 		return m.usageReactivator, nil
 	}()
 	if err != nil {
@@ -1730,6 +1825,7 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 				cur.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: now}
 				delete(m.flights, id) // runs under m.mu (mutate holds it)
 				delete(m.steps, id)
+				delete(m.launchedAt, id)
 				outcome = terminationApplied
 				return cur, true
 			}
@@ -1740,6 +1836,9 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 		switch outcome {
 		case terminationApplied, terminationAlreadyApplied:
 			m.reapSessionContainers(ctx, id)
+			if outcome == terminationApplied {
+				m.notifyTerminated(ctx, id)
+			}
 			return nil
 		case terminationLaunchChanged:
 			return fmt.Errorf("lifecycle: runtime launch changed while terminating session %q", id)

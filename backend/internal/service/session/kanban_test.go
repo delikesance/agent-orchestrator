@@ -357,3 +357,21 @@ func seedKanbanTestProject(t *testing.T, st *sqlite.Store, id string) {
 		t.Fatalf("seed project %s: %v", id, err)
 	}
 }
+
+func TestKanbanFactsCarryPipelineStageAndCapTheLane(t *testing.T) {
+	rec := domain.SessionRecord{PipelineStage: domain.PipelineStageValidating}
+	facts := toContractKanbanSessionFacts(rec, false, true)
+	if facts.PipelineStage != "validating" {
+		t.Fatalf("PipelineStage = %q, want validating", facts.PipelineStage)
+	}
+	prs := []domain.PRFacts{{URL: "pr/1", Mergeability: domain.MergeMergeable}}
+	got := deriveKanbanPresentation(rec, prs, nil, false, time.Now(), true)
+	if got.Column != contract.KanbanValidating {
+		t.Fatalf("column = %q, want validating under the ceiling", got.Column)
+	}
+	rec.PipelineStage = domain.PipelineStageNone
+	got = deriveKanbanPresentation(rec, prs, nil, false, time.Now(), true)
+	if got.Column != contract.KanbanReady {
+		t.Fatalf("legacy column = %q, want ready", got.Column)
+	}
+}
