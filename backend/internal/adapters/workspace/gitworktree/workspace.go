@@ -253,9 +253,13 @@ func (w *Workspace) FetchDefaultBranch(ctx context.Context, repoPath string, tar
 	if err := w.validateBranch(ctx, repo, target.Branch); err != nil {
 		return err
 	}
+	if gitdefault.RecentlyFetched(repo, target.Remote, target.Branch) {
+		return nil
+	}
 	if _, err := w.run(ctx, w.binary, fetchBranchArgs(repo, target.Remote, target.Branch)...); err != nil {
 		return fmt.Errorf("gitworktree: fetch %s %s: %w", target.Remote, target.Branch, err)
 	}
+	gitdefault.MarkFetched(repo, target.Remote, target.Branch)
 	return nil
 }
 
