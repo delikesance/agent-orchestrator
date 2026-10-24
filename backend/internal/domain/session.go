@@ -316,6 +316,12 @@ type SessionRecord struct {
 	// Depth is the spawn distance from the orchestrator (orchestrator 0, its
 	// workers 1, their children 2). Fixed at insertion and read-only in the API.
 	Depth int `json:"depth"`
+	// PipelineStage and PipelineAttempt are the daemon-owned delivery pipeline
+	// position (docs/plans/mandatory-pipeline.md). Empty stage is a legacy,
+	// unenforced session. Never accepted from or echoed by a request DTO; only
+	// the pipeline service writes them, through the store's compare-and-set.
+	PipelineStage   PipelineStage `json:"-"`
+	PipelineAttempt int           `json:"-"`
 	// HibernatedAt records that the idle Chat controller was stopped while the
 	// session and conversation remain resumable. Nil means no recorded hibernation.
 	HibernatedAt *time.Time `json:"hibernatedAt,omitempty"`

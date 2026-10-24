@@ -41,6 +41,9 @@ type APIDeps struct {
 	SessionSteps       controllers.SessionStepsReader
 	PRs                prsvc.ActionManager
 	Reviews            reviewsvc.Manager
+	// Pipeline is the mandatory delivery pipeline service; nil leaves the
+	// session pipeline block and /pipeline routes unimplemented.
+	Pipeline controllers.PipelineService
 	Notifications      controllers.NotificationService
 	Reports            controllers.ReportService
 	NotificationStream controllers.NotificationStream
@@ -90,6 +93,11 @@ type APIDeps struct {
 	// DeviceRoster and DeviceLive back the desktop-only mobile device roster.
 	DeviceRoster controllers.DeviceRoster
 	DeviceLive   controllers.LiveSet
+
+	// SessionSecret is the daemon secret behind AO_SESSION_TOKEN. The request
+	// middleware verifies X-AO-Session/X-AO-Session-Token against it; empty
+	// leaves every caller unverified.
+	SessionSecret []byte
 }
 
 // normalizeAPIDeps closes the Presence/DeviceLive duplication trap structurally.
@@ -134,6 +142,7 @@ type API struct {
 	usage         *controllers.UsageController
 	prs           *controllers.PRsController
 	reviews       *controllers.ReviewsController
+	pipeline      *controllers.PipelineController
 	notifications *controllers.NotificationsController
 	reports       *controllers.ReportsController
 	push          *controllers.PushController
@@ -188,6 +197,7 @@ func newAPIWithLogger(cfg config.Config, deps APIDeps, log *slog.Logger) *API {
 			PreviewServer:            deps.PreviewServer,
 			Capabilities:             deps.SessionCapabilities,
 			ArtifactVersions:         deps.ArtifactVersions,
+			Pipeline:                 deps.Pipeline,
 			ShellPreviewCapabilities: deps.ShellPreviewCapabilities,
 			AgentBrowser:             agentBrowserURL(cfg.AgentBrowserURL),
 			AgentBrowserToken:        cfg.AgentBrowserToken,
@@ -197,6 +207,7 @@ func newAPIWithLogger(cfg config.Config, deps APIDeps, log *slog.Logger) *API {
 		usage:         &controllers.UsageController{Svc: deps.UsageSummary, Log: loggerOrDefault(log), Memory: deps.SessionMemory, Steps: deps.SessionSteps, Pressure: memoryPressure(deps.SessionMemory)},
 		prs:           &controllers.PRsController{Svc: deps.PRs},
 		reviews:       &controllers.ReviewsController{Svc: deps.Reviews},
+		pipeline:      &controllers.PipelineController{Svc: deps.Pipeline, Sessions: deps.Sessions},
 		notifications: &controllers.NotificationsController{Svc: deps.Notifications, Stream: deps.NotificationStream},
 		reports:       &controllers.ReportsController{Svc: deps.Reports},
 		push:          &controllers.PushController{Registry: deps.Push},
@@ -311,6 +322,7 @@ func (a *API) Register(root chi.Router) {
 			a.usage.Register(r)
 			a.prs.Register(r)
 			a.reviews.Register(r)
+			a.pipeline.Register(r)
 			a.notifications.Register(r)
 			a.reports.Register(r)
 			a.push.Register(r)

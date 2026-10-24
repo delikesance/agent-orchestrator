@@ -53,7 +53,13 @@ type Coordinator struct {
 	idleThreshold time.Duration
 	sweepInterval time.Duration
 	logger        *slog.Logger
+	sweepHooks    []SweepHook
 }
+
+// SweepHook is extra periodic work that rides the coordinator's sweep ticker,
+// so the daemon keeps one cadence and one goroutine for session sweeps. A hook's
+// error is logged and never stops the sweep or the other hooks.
+type SweepHook func(context.Context) error
 
 // Config customizes coordinator timing and logging.
 type Config struct {
@@ -61,11 +67,13 @@ type Config struct {
 	IdleThreshold time.Duration
 	SweepInterval time.Duration
 	Logger        *slog.Logger
+	// SweepHooks run after each sweep, in order.
+	SweepHooks []SweepHook
 }
 
 // New constructs an auto-review coordinator.
 func New(store Store, reviews Trigger, cfg Config) *Coordinator {
-	c := &Coordinator{store: store, reviews: reviews, clock: cfg.Clock, idleThreshold: cfg.IdleThreshold, sweepInterval: cfg.SweepInterval, logger: cfg.Logger}
+	c := &Coordinator{store: store, reviews: reviews, clock: cfg.Clock, idleThreshold: cfg.IdleThreshold, sweepInterval: cfg.SweepInterval, logger: cfg.Logger, sweepHooks: cfg.SweepHooks}
 	if c.clock == nil {
 		c.clock = time.Now
 	}
@@ -100,6 +108,13 @@ func (c *Coordinator) EvaluateSession(ctx context.Context, id domain.SessionID) 
 			return Result{Reason: "missing_reviewer_harness"}, nil
 		}
 		return Result{}, err
+	}
+	// A session in the mandatory delivery pipeline gets its review from the
+	// pipeline driver once validation passes, on the head the gates bind to; the
+	// pipeline is the single trigger path, so the sweep must not start a second
+	// review for the same head. Off mode leaves the session to the sweep.
+	if session.PipelineStage.Enforced() && project.Config.ResolvedPipeline().Enforce != domain.PipelineEnforceOff {
+		return Result{Reason: "pipeline_managed"}, nil
 	}
 	harness := effectiveReviewerHarness(session, project.Config)
 	if harness == "" {
@@ -256,8 +271,10 @@ func sessionGate(session domain.SessionRecord, now time.Time, threshold time.Dur
 	return ""
 }
 
-// Sweep evaluates every known session, isolating per-session failures.
+// Sweep evaluates every known session, isolating per-session failures, then runs
+// the registered sweep hooks.
 func (c *Coordinator) Sweep(ctx context.Context) error {
+	defer c.runSweepHooks(ctx)
 	sessions, err := c.store.ListAllSessions(ctx)
 	if err != nil {
 		return err
@@ -271,6 +288,17 @@ func (c *Coordinator) Sweep(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (c *Coordinator) runSweepHooks(ctx context.Context) {
+	for _, hook := range c.sweepHooks {
+		if hook == nil {
+			continue
+		}
+		if err := hook(ctx); err != nil {
+			c.logger.Error("auto-review: sweep hook failed", "err", err)
+		}
+	}
 }
 
 // Start evaluates persisted session and PR facts on the configured cadence

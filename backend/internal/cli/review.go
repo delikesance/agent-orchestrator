@@ -72,6 +72,7 @@ type triggerReviewRequest struct {
 	RejectReviewedHead bool               `json:"rejectReviewedHead,omitempty"`
 	Rerun              bool               `json:"rerun,omitempty"`
 	EnableAutoInject   bool               `json:"enableAutoInject,omitempty"`
+	Target             string             `json:"target,omitempty"`
 }
 
 // reviewAgentConfig mirrors the model/effort subset of domain.AgentConfig a
@@ -126,6 +127,7 @@ type reviewTriggerOptions struct {
 	effort   string
 	rerun    bool
 	noInject bool
+	target   string
 }
 
 // envReviewSessionID is set only inside reviewer panes (see
@@ -390,6 +392,7 @@ approval and does not authorize merging.`,
 	f.StringVar(&opts.model, "model", "", "Reviewer model for this pass only")
 	f.StringVar(&opts.effort, "effort", "", "Reviewer reasoning effort for this pass only")
 	f.BoolVar(&opts.rerun, "rerun", false, "Review heads that already have a review again, or add another reviewer alongside a running one")
+	f.StringVar(&opts.target, "target", "", "What to review: pr (the session's pull requests, the default) or branch (the session branch head against its base, for a session with no PR)")
 	f.BoolVar(&opts.noInject, "no-inject", false, "Leave the session's review auto-inject setting unchanged")
 	return cmd
 }
@@ -402,7 +405,12 @@ func (c *commandContext) triggerReview(cmd *cobra.Command, args []string, opts r
 	if session == "" {
 		return usageError{errors.New("usage: worker session id is required (positional or --session) outside an AO session")}
 	}
+	target := strings.ToLower(strings.TrimSpace(opts.target))
+	if target != "" && target != "pr" && target != "branch" {
+		return usageError{fmt.Errorf("invalid --target %q: use pr or branch", opts.target)}
+	}
 	req := triggerReviewRequest{
+		Target:             target,
 		Harness:            strings.TrimSpace(opts.harness),
 		PRURL:              strings.TrimSpace(opts.prURL),
 		RejectReviewedHead: !opts.rerun,

@@ -21,13 +21,16 @@ const (
 	NotificationReviewCompleted NotificationType = "review_completed"
 	// NotificationReviewChangesRequested means an AO reviewer found changes to make.
 	NotificationReviewChangesRequested NotificationType = "review_changes_requested"
+	// NotificationPipelineEscalated means a delivery-pipeline session was parked
+	// and needs a user decision. It is not tied to a PR.
+	NotificationPipelineEscalated NotificationType = "pipeline_escalated"
 )
 
 // Valid reports whether t is one of the v1 notification kinds.
 func (t NotificationType) Valid() bool {
 	switch t {
 	case NotificationNeedsInput, NotificationReadyToMerge, NotificationPRMerged, NotificationPRClosedUnmerged,
-		NotificationReviewCompleted, NotificationReviewChangesRequested:
+		NotificationReviewCompleted, NotificationReviewChangesRequested, NotificationPipelineEscalated:
 		return true
 	default:
 		return false

@@ -3645,20 +3645,24 @@ func TestActivity_FirstSignalStampsReceipt(t *testing.T) {
 	}
 }
 
-func captureSlog(t *testing.T) *bytes.Buffer {
+// captureLogger returns a buffer and the Option that injects a logger writing
+// to it, plus a second buffer standing in for slog.Default so a test can prove
+// a line went through the injected logger (the daemon.log one) and not the
+// process default (stderr).
+func captureLogger(t *testing.T) (injected *bytes.Buffer, opt Option, processDefault *bytes.Buffer) {
 	t.Helper()
-	var logs bytes.Buffer
+	injected, processDefault = &bytes.Buffer{}, &bytes.Buffer{}
 	previousLogger := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	slog.SetDefault(slog.New(slog.NewTextHandler(processDefault, nil)))
 	t.Cleanup(func() { slog.SetDefault(previousLogger) })
-	return &logs
+	return injected, WithLogger(slog.New(slog.NewTextHandler(injected, nil))), processDefault
 }
 
 var firstSignalMsRe = regexp.MustCompile(`first_signal_ms=(\d+)`)
 
 func TestActivity_FirstSignalLogsSpawnTimingOnce(t *testing.T) {
-	logs := captureSlog(t)
-	m, st, _ := newManager()
+	logs, logOpt, processDefault := captureLogger(t)
+	m, st, _ := newManager(logOpt)
 	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Harness: "claude-code", CreatedAt: time.Now().Add(-time.Hour), Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: time.Now()}}
 	if err := m.MarkSpawned(ctx, "mer-1", domain.SessionMetadata{RuntimeLaunchID: "launch-1"}); err != nil {
 		t.Fatal(err)
@@ -3674,6 +3678,9 @@ func TestActivity_FirstSignalLogsSpawnTimingOnce(t *testing.T) {
 	if ms, _ := strconv.Atoi(mm[1]); ms > 60_000 {
 		t.Fatalf("first_signal_ms = %d, want measured from launch, not CreatedAt", ms)
 	}
+	if strings.Contains(processDefault.String(), "spawn: first signal") {
+		t.Fatalf("first signal leaked to slog.Default instead of the injected logger: %q", processDefault.String())
+	}
 	logs.Reset()
 	if err := m.ApplyActivitySignal(ctx, "mer-1", ports.ActivitySignal{Valid: true, State: domain.ActivityActive, LaunchID: "launch-1", Timestamp: time.Now().Add(time.Minute)}); err != nil {
 		t.Fatal(err)
@@ -3684,8 +3691,8 @@ func TestActivity_FirstSignalLogsSpawnTimingOnce(t *testing.T) {
 }
 
 func TestActivity_FirstSignalRestoreMeasuredFromRelaunch(t *testing.T) {
-	logs := captureSlog(t)
-	m, st, _ := newManager()
+	logs, logOpt, _ := captureLogger(t)
+	m, st, _ := newManager(logOpt)
 	rec := working("mer-1")
 	rec.Harness = "claude-code"
 	rec.CreatedAt = time.Now().Add(-24 * time.Hour)
@@ -3709,8 +3716,8 @@ func TestActivity_FirstSignalRestoreMeasuredFromRelaunch(t *testing.T) {
 }
 
 func TestActivity_FirstSignalWithoutLaunchEntryLogsUnknown(t *testing.T) {
-	logs := captureSlog(t)
-	m, st, _ := newManager()
+	logs, logOpt, _ := captureLogger(t)
+	m, st, _ := newManager(logOpt)
 	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Harness: "claude-code", CreatedAt: time.Now().Add(-time.Hour), Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: time.Now()}}
 	if err := m.ApplyActivitySignal(ctx, "mer-1", ports.ActivitySignal{Valid: true, State: domain.ActivityIdle}); err != nil {
 		t.Fatal(err)

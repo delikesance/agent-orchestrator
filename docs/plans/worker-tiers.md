@@ -71,6 +71,16 @@ Feasible and small. `Spawn` logs `spawn: timings` (`session_manager/spawn_phases
 - Test: existing FirstSignalAt tests in `lifecycle/manager_test.go` plus a capturing slog handler: exactly one line on the first hook, none on the second.
 - Use: compare `first_signal_ms` per harness and model to confirm `fast` is actually faster.
 
+## Phase 6: verifying `fast` costs less (usage by tier) (implemented)
+Status: implemented. `SessionView` carries `tier`/`effort`, and `ao usage [--by tier|model] [--project <id>] [--json]` (`cli/usage.go`) joins `GET /sessions` with `GET /usage/sessions` client-side; compare tiers with `ao usage --by tier`. Compact usage exposes only processed tokens (input+output) and total cost nanos, so the table shows those, not the input/cached/output split (that lives on `GET /usage/sessions/{id}`). Text below is the original design.
+Usage is already recorded per session and per model: `model_usage_events` joined to `usage_bindings.session_id` holds input/cached/output tokens and estimated cost nanos per event (`storage/sqlite/queries/usage.sql`: `AggregateUsageBySessionHarnessModel`, `ListCompactSessionUsage`), fed from the Claude transcript path declared in the hook `usage` metadata. Read APIs: `GET /usage/sessions?projectId=` (compact tokens + cost per session) and `GET /usage/sessions/{id}` (per harness and model). There is no `ao usage` CLI.
+Missing: the tier is not on the wire. `SessionView` (`httpd/controllers/dto.go`) exposes `model` but not `tier` or `effort`, and `ListCompactSessionUsage` has no tier column, so a client cannot group cost by tier. No new tracker is needed.
+Smallest design:
+- Add `tier` (and `effort`) to `SessionView`, pulled from `Metadata.Tier`/`Metadata.Effort`, empty meaning `standard`; regenerate the spec.
+- Then add `ao usage --by tier|model` in `cli/` (new `usage.go`, documented in `docs/cli/README.md`): list sessions, fetch `usage/sessions`, join on session id client-side, sum `processedTokens` and `estimatedCost.totalNanos` per tier, empty tier -> `standard`. Tests: empty-tier fallback, sessions without usage rows.
+- Show `tier`, `model`, `effort` in `ao session get` once the DTO carries them.
+Interim check without API changes: group by `model`, since `fast` resolves to a distinct model for Claude.
+
 ## Open questions
 1. Claude `deep` effort: cap at `high`, or use the top advertised level?
 2. Non-Claude harnesses: is effort-only tiering acceptable, or limit v1 to Claude and Codex?

@@ -133,6 +133,12 @@ type terminationObserver interface {
 	OnSessionTerminated(ctx context.Context, id domain.SessionID)
 }
 
+// pipelineObserver is the narrow port to the mandatory delivery pipeline's PR
+// facts hook. It must not block: the pipeline runs its work off this goroutine.
+type pipelineObserver interface {
+	OnPRObservation(id domain.SessionID, o ports.PRObservation)
+}
+
 type sessionUsageFinalizer interface {
 	FinalizeSession(
 		ctx context.Context,
@@ -166,6 +172,21 @@ func WithNotificationSink(sink notificationSink) Option {
 // WithTelemetry wires lifecycle activity transitions to the shared telemetry sink.
 func WithTelemetry(sink ports.EventSink) Option {
 	return func(m *Manager) { m.telemetry = sink }
+}
+
+// WithLogger routes lifecycle diagnostics (the spawn first-signal timing line)
+// through the daemon logger so they reach daemon.log; without it they go to
+// slog.Default.
+func WithLogger(l *slog.Logger) Option {
+	return func(m *Manager) { m.logger = l }
+}
+
+// log is the injected logger, or slog.Default when none was wired.
+func (m *Manager) log() *slog.Logger {
+	if m.logger != nil {
+		return m.logger
+	}
+	return slog.Default()
 }
 
 // WithDataDir supplies AO's data directory so ReconcileSessionOutputType can
@@ -239,6 +260,9 @@ type Manager struct {
 	// terminationObserver fires once per session, on the transition to
 	// terminated only (never on an already-terminated no-op).
 	terminationObserver terminationObserver
+	// pipelineObserver sees every fetched PR observation (head moves, CI
+	// settling, merges). It is best-effort and late-bound by the daemon.
+	pipelineObserver pipelineObserver
 	// usageFinalizer is late-bound because the usage pipeline is optional. It
 	// receives terminal intent before is_terminated makes the session ineligible
 	// for normal source discovery.
@@ -251,6 +275,9 @@ type Manager struct {
 	// dataDir backs ReconcileSessionOutputType's artifact-dir fallback for
 	// sessions rows created before session_output_type/artifact_dir existed.
 	dataDir string
+	// logger receives lifecycle diagnostics that must land in the daemon log
+	// (spawn: first signal). Nil falls back to slog.Default via log().
+	logger *slog.Logger
 
 	mu        sync.Mutex
 	window    time.Duration
@@ -333,6 +360,22 @@ func (m *Manager) SetTerminationObserver(observer terminationObserver) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.terminationObserver = observer
+}
+
+// SetPipelineObserver wires the delivery pipeline's PR facts hook.
+func (m *Manager) SetPipelineObserver(observer pipelineObserver) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pipelineObserver = observer
+}
+
+func (m *Manager) notifyPipeline(id domain.SessionID, o ports.PRObservation) {
+	m.mu.Lock()
+	observer := m.pipelineObserver
+	m.mu.Unlock()
+	if observer != nil {
+		observer.OnPRObservation(id, o)
+	}
 }
 
 func (m *Manager) notifyTerminated(ctx context.Context, id domain.SessionID) {
@@ -1110,7 +1153,7 @@ retryProjection:
 	waitingEvents := m.waitingInputEvents(next, prevState, prevAt, now)
 	m.mu.Unlock()
 	if firstSignalAttrs != nil {
-		slog.Default().Info("spawn: first signal", firstSignalAttrs...)
+		m.log().Info("spawn: first signal", firstSignalAttrs...)
 	}
 	if prevState != domain.ActivityIdle && next.Activity.State == domain.ActivityIdle {
 		m.operationGateMu.RLock()

@@ -10,10 +10,12 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 )
 
 // commandTimeout bounds a mutating daemon call. Calls do real work (tmux
@@ -200,6 +202,12 @@ func (c *commandContext) doJSONPathWithHeadersAndTimeout(
 	}
 	if sideID := os.Getenv("AO_SIDE_CONVERSATION_ID"); sideID != "" {
 		req.Header.Set("X-AO-Side-Conversation", sideID)
+	}
+	// Prove which session is calling. The daemon never rejects on these; it
+	// only marks the caller verified (see package sessionauth).
+	if sessionID, token := strings.TrimSpace(os.Getenv("AO_SESSION_ID")), strings.TrimSpace(os.Getenv(sessionauth.EnvSessionToken)); sessionID != "" && token != "" {
+		req.Header.Set(sessionauth.HeaderSession, sessionID)
+		req.Header.Set(sessionauth.HeaderSessionToken, token)
 	}
 
 	// Reuse the injected client's transport (keeps it stubbable in tests) but

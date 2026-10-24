@@ -86,6 +86,10 @@ type ProjectConfig struct {
 	// the feature but check with the user or orchestrator before using it.
 	// Read at spawn, when the worker prompt is built.
 	WorkersRequestReview bool `json:"workersRequestReview,omitempty"`
+
+	// Pipeline configures the mandatory delivery pipeline (building, validating,
+	// review, ready). The zero value means defaults; see PipelineConfig.
+	Pipeline PipelineConfig `json:"pipeline,omitempty"`
 }
 
 // ContainerReapConfig is the project-level opt-out for #2652's Docker
@@ -194,6 +198,13 @@ func (c ProjectConfig) WithDefaults() ProjectConfig {
 	return c
 }
 
+// ResolvedPipeline is the pipeline block with defaults filled. WithDefaults
+// leaves Pipeline untouched so an unset block stays zero and stores as NULL;
+// readers of the effective settings use this instead.
+func (c ProjectConfig) ResolvedPipeline() PipelineConfig {
+	return c.Pipeline.WithDefaults()
+}
+
 // WorktreeBaseBranch translates project configuration into the workspace
 // interface. An empty value tells the workspace adapter to resolve a remote
 // HEAD independently for the repository it is materializing.
@@ -270,6 +281,9 @@ func (c ProjectConfig) Validate() error {
 		}
 	}
 	if err := c.TrackerIntake.Validate(); err != nil {
+		return err
+	}
+	if err := c.Pipeline.Validate(); err != nil {
 		return err
 	}
 	return nil

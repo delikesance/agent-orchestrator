@@ -23,7 +23,8 @@ INSERT INTO sessions (
     requested_output,
     created_at, updated_at, is_pinned, pinned_at, auto_inject_review, auto_inject_ci,
     provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed,
-    client_request_id, client_request_hash, parent_session_id, spawn_depth, tier
+    client_request_id, client_request_hash, parent_session_id, spawn_depth, tier,
+    pipeline_stage, pipeline_attempt
 ) VALUES (
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
@@ -31,7 +32,7 @@ INSERT INTO sessions (
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-    ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?
 );
 
 -- name: GetClientRequestSession :one
@@ -294,7 +295,8 @@ SELECT id, project_id, num, issue_id, kind, harness,
     claude_activity_facts, codex_activity_facts,
     hibernated_at, stale_binary_since, stale_binary_version, stale_binary_launch, stale_binary_switch_failed_at,
     client_request_id, client_request_hash, client_request_committed,
-    runtime_released_launch_id, parent_session_id, spawn_depth, tier
+    runtime_released_launch_id, parent_session_id, spawn_depth, tier,
+    pipeline_stage, pipeline_attempt
 FROM sessions WHERE id = ?;
 
 -- name: GetSessionByAutomationRunID :one
@@ -316,7 +318,8 @@ SELECT id, project_id, num, issue_id, kind, harness,
     claude_activity_facts, codex_activity_facts,
     hibernated_at, stale_binary_since, stale_binary_version, stale_binary_launch, stale_binary_switch_failed_at,
     client_request_id, client_request_hash, client_request_committed,
-    runtime_released_launch_id, parent_session_id, spawn_depth, tier
+    runtime_released_launch_id, parent_session_id, spawn_depth, tier,
+    pipeline_stage, pipeline_attempt
 FROM sessions WHERE automation_run_id = ?;
 
 -- name: ListSessionsByProject :many
@@ -338,7 +341,8 @@ SELECT id, project_id, num, issue_id, kind, harness,
     claude_activity_facts, codex_activity_facts,
     hibernated_at, stale_binary_since, stale_binary_version, stale_binary_launch, stale_binary_switch_failed_at,
     client_request_id, client_request_hash, client_request_committed,
-    runtime_released_launch_id, parent_session_id, spawn_depth, tier
+    runtime_released_launch_id, parent_session_id, spawn_depth, tier,
+    pipeline_stage, pipeline_attempt
 FROM sessions WHERE project_id IS ? ORDER BY num;
 
 -- name: ListAllSessions :many
@@ -360,7 +364,8 @@ SELECT id, project_id, num, issue_id, kind, harness,
     claude_activity_facts, codex_activity_facts,
     hibernated_at, stale_binary_since, stale_binary_version, stale_binary_launch, stale_binary_switch_failed_at,
     client_request_id, client_request_hash, client_request_committed,
-    runtime_released_launch_id, parent_session_id, spawn_depth, tier
+    runtime_released_launch_id, parent_session_id, spawn_depth, tier,
+    pipeline_stage, pipeline_attempt
 FROM sessions ORDER BY project_id, num;
 
 -- name: ListChatHibernationCandidates :many
@@ -411,6 +416,8 @@ UPDATE sessions SET
     parent_session_id = sqlc.arg(parent_session_id),
     spawn_depth = sqlc.arg(spawn_depth),
     tier = sqlc.arg(tier),
+    pipeline_stage = sqlc.arg(pipeline_stage),
+    pipeline_attempt = sqlc.arg(pipeline_attempt),
     is_task_preparation = 0
 WHERE id = sqlc.arg(id) AND is_task_preparation = 1;
 
@@ -548,7 +555,7 @@ SELECT EXISTS(
 ) AS is_seed;
 
 -- NOTE: the `DELETE FROM sessions WHERE id = ? AND <seed-state predicates>`
--- statement is intentionally NOT a sqlc query — same sqlc 1.31 SQLite-parser
+-- statement is intentionally NOT a sqlc query - same sqlc 1.31 SQLite-parser
 -- bug as documented in queries/changelog.sql: trailing string literals (and
 -- placeholders) on the RHS of `=` in a DELETE get silently stripped, so the
 -- generated SQL ends up mid-clause and the row count is meaningless. The

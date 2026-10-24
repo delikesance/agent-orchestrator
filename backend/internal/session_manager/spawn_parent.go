@@ -15,7 +15,8 @@ import (
 // AO_SESSION_ID is set in every session, so a stale value is an ordinary input.
 // A missing parent, or a dead or cross-project orchestrator, is ignored as it
 // always was. The same fault in a worker parent is ErrInvalidParent: that spawn
-// is a nested child and must not be created outside the guardrails.
+// is a nested child and must not be created outside the guardrails. With strict
+// session auth on, an unverified worker parent claim is refused the same way.
 func (m *Manager) resolveSpawnParent(ctx context.Context, cfg ports.SpawnConfig) (*domain.SessionRecord, error) {
 	if cfg.ParentSessionID == "" {
 		return nil, nil
@@ -33,6 +34,11 @@ func (m *Manager) resolveSpawnParent(ctx context.Context, cfg ports.SpawnConfig)
 		reason = fmt.Sprintf("parent %s belongs to another project", parent.ID)
 	case parent.IsTerminated:
 		reason = fmt.Sprintf("parent %s is terminated", parent.ID)
+	}
+	if reason == "" && m.strictSessionAuth && parent.Kind == domain.KindWorker && !cfg.ParentVerified {
+		// AO_SESSION_ID alone is forgeable on loopback: in strict mode a worker
+		// parent must be proven by its session token.
+		return nil, fmt.Errorf("%w: parent %s is not authenticated (missing or invalid session token)", ErrInvalidParent, parent.ID)
 	}
 	if reason == "" {
 		return &parent, nil

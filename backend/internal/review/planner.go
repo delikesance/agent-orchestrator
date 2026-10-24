@@ -125,17 +125,21 @@ func latestRunsByPRAndSHA(runs []domain.ReviewRun) map[string]domain.ReviewRun {
 			latest[key] = run
 			continue
 		}
-		runRunning := run.Status == domain.ReviewRunRunning
-		existingRunning := existing.Status == domain.ReviewRunRunning
-		if runRunning != existingRunning {
-			if runRunning {
-				latest[key] = run
-			}
-			continue
-		}
-		if run.CreatedAt.After(existing.CreatedAt) {
+		if preferRun(existing, run) {
 			latest[key] = run
 		}
 	}
 	return latest
+}
+
+// preferRun reports whether run should replace existing as the authoritative
+// pass for one head: a running pass wins over a terminal one, otherwise the
+// newer pass wins.
+func preferRun(existing, run domain.ReviewRun) bool {
+	runRunning := run.Status == domain.ReviewRunRunning
+	existingRunning := existing.Status == domain.ReviewRunRunning
+	if runRunning != existingRunning {
+		return runRunning
+	}
+	return run.CreatedAt.After(existing.CreatedAt)
 }

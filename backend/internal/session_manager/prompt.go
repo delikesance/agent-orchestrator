@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
 type sessionPromptRole string
@@ -78,7 +80,7 @@ func buildSystemPromptText(cfg systemPromptConfig) string {
 	sections := make([]string, 0, 6)
 	switch cfg.Role {
 	case sessionPromptRoleOrchestrator:
-		sections = append(sections, orchestratorSystemPrompt(cfg.Project))
+		sections = append(sections, orchestratorSystemPrompt(cfg.Project), orchestratorPipelinePrompt(), orchestratorWaitingPrompt(), orchestratorParallelismPrompt())
 		if rules := strings.TrimSpace(cfg.OrchestratorRules); rules != "" {
 			sections = append(sections, "## Project-Specific Orchestrator Rules\n"+rules)
 		}
@@ -278,10 +280,44 @@ Your job is to coordinate work, not to perform implementation. Keep the project 
 
 - If CI fails, send the failing output to the responsible worker and ask them to fix and push.
 - If review changes are requested on an AO worker's implementation PR, send the review findings to that implementation worker. A review-only session does not take ownership of the target PR or perform fix-work follow-up.
-- If work is green and approved, report that state to the human. Do not merge unless explicitly asked and supported by project rules.
+- If work is green and approved, report that state to the human. Merging is governed by the Pipeline section below.
 - An AO review approval is internal. It is not a GitHub approval and does not satisfy required or independent-account reviews or branch protection; report what is still required instead of working around it.
 
 %s`, projectName(project), project.ID, project.ID, project.ID, projectContextSection(project))
+}
+
+// orchestratorPipelinePrompt describes the mandatory delivery pipeline. Stage
+// names come from the domain constants so the prompt cannot drift from them.
+func orchestratorPipelinePrompt() string {
+	building, validating, review := domain.PipelineStageBuilding, domain.PipelineStageValidating, domain.PipelineStageReview
+	ready, escalated := domain.PipelineStageReady, domain.PipelineStageEscalated
+	return fmt.Sprintf(`## Pipeline
+
+Every task you spawn moves through %[1]s -> %[2]s -> %[3]s -> %[4]s. Stages cannot be skipped. The daemon drives validation and review; you do not run them.
+
+- Merge only %[4]s tasks, with `+"`ao pr merge <n>`"+`. Never merge a task that is not %[4]s, and do not ask a worker to merge.
+- When a %[4]s nudge arrives, merge that task.
+- Read a task's stage with `+"`ao session get <worker-session-id>`"+`.
+- When a task reaches %[5]s, tell the user; the daemon has stopped working on it.`, building, validating, review, strings.ToUpper(string(ready)), escalated)
+}
+
+// orchestratorWaitingPrompt and orchestratorParallelismPrompt guide how the
+// orchestrator waits on and sizes its worker fleet. Daemon caps come from the
+// spawn limit constants so the text cannot drift from them.
+func orchestratorWaitingPrompt() string {
+	return `## Waiting
+
+- Do not poll workers in a loop. Daemon notices (task ready, validation failed, review changes requested, escalated, child report) already arrive as messages.
+- If you have a Monitor or wait tool, use it instead of repeated polling; otherwise check state only when a notice arrives or at a long interval.`
+}
+
+func orchestratorParallelismPrompt() string {
+	return fmt.Sprintf(`## Parallelism
+
+- Run 2-3 workers at a time by default; add more only while you can still review their results.
+- Independent tasks go in parallel; tasks that share files run one after the other.
+- The daemon caps active workers at %d and active children per worker at %d; do not plan beyond them.
+- Use `+"`--tier fast`"+` for small independent tasks and the default tier otherwise.`, DefaultMaxActiveWorkers, DefaultMaxActiveChildren)
 }
 
 func workerSystemPrompt(project promptProject, hasOrchestrator bool) string {
@@ -325,6 +361,7 @@ Your job is to complete the assigned task in this workspace. For implementation,
 ## Session Lifecycle
 
 - Focus on the assigned task only.
+- Never merge a PR yourself. Report `+"`ao report --done`"+` and let the orchestrator merge once the task is ready.
 - Do not take unrelated work or perform broad refactors.
 - If you are continuing implementation, CI recovery, review-comment follow-up, or other explicitly authorized work that continues or changes an existing PR, claim or attach it through AO before changing it when the workflow supports that. From this worker, use `+"`ao session claim-pr <pr-ref>`"+`; `+"`AO_SESSION_ID`"+` selects this session automatically. Never claim or attach a PR for a review-only task.
 - For implementation work, if CI fails, fix the failures and push again.

@@ -71,6 +71,7 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 	if !o.Fetched {
 		return nil
 	}
+	m.notifyPipeline(id, o)
 	// A PR observation is this session's earliest opportunity to durably record
 	// "this session produced a PR" — reconcile immediately rather than waiting
 	// for the artifact-output poller's next tick. A failure here must not

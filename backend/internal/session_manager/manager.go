@@ -27,6 +27,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 	"github.com/aoagents/agent-orchestrator/backend/internal/sessionartifacts"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 	"github.com/aoagents/agent-orchestrator/backend/internal/sessionguard"
 	"github.com/aoagents/agent-orchestrator/backend/internal/skillassets"
 	"github.com/aoagents/agent-orchestrator/backend/internal/termtheme"
@@ -187,7 +188,11 @@ func wrapSpawnStageEarly(stage, err error) error {
 const (
 	EnvSessionID = "AO_SESSION_ID"
 	EnvProjectID = "AO_PROJECT_ID"
-	EnvIssueID   = "AO_ISSUE_ID"
+	// EnvSessionToken authenticates AO_SESSION_ID to the daemon: the CLI sends
+	// both as X-AO-Session / X-AO-Session-Token. Strict nested-spawn auth is
+	// switched on with AO_STRICT_SESSION_AUTH=1 (default off).
+	EnvSessionToken = sessionauth.EnvSessionToken
+	EnvIssueID      = "AO_ISSUE_ID"
 	// EnvRuntimeLaunchID identifies the current supervised agent generation.
 	EnvRuntimeLaunchID = "AO_RUNTIME_LAUNCH_ID"
 	// EnvSupervisedProcess tells terminal runtimes that the AO supervisor owns
@@ -410,6 +415,8 @@ type Manager struct {
 	attachmentSuffix            func() (string, error)
 	dataDir                     string
 	runFilePath                 string
+	sessionSecret               []byte
+	strictSessionAuth           bool
 	clock                       func() time.Time
 	reconcileWorkers            int
 	defaultBranchRefreshTimeout time.Duration
@@ -783,7 +790,14 @@ type Deps struct {
 	// RunFilePath is exported to spawned agents as AO_RUN_FILE so their hook
 	// callbacks reach this daemon even when another AO daemon is also running.
 	RunFilePath string
-	Clock       func() time.Time
+	// SessionSecret keys AO_SESSION_TOKEN, the per-session proof exported next
+	// to AO_SESSION_ID (see package sessionauth). Empty exports no token.
+	SessionSecret []byte
+	// StrictSessionAuth makes a nested spawn whose worker parent is not
+	// backed by a verified caller fail with ErrInvalidParent. Daemon wiring
+	// sets it from AO_STRICT_SESSION_AUTH; default off.
+	StrictSessionAuth bool
+	Clock             func() time.Time
 	// LookPath overrides exec.LookPath for the pre-launch agent-binary check.
 	// Production wiring leaves this nil and the manager defaults to
 	// exec.LookPath; tests inject a stub so they need not seed real binaries.
@@ -846,6 +860,8 @@ func New(d Deps) *Manager {
 		attachmentSuffix:               randomSuffix,
 		dataDir:                        d.DataDir,
 		runFilePath:                    strings.TrimSpace(d.RunFilePath),
+		sessionSecret:                  d.SessionSecret,
+		strictSessionAuth:              d.StrictSessionAuth,
 		clock:                          d.Clock,
 		reconcileWorkers:               d.ReconcileWorkers,
 		defaultBranchRefreshTimeout:    defaultBranchRefreshTimeout,
@@ -5840,6 +5856,7 @@ func normalizeWorkspacePath(p string) string {
 // clears when the parent was ignored, and the tier is the requested tier name.
 func seedRecord(cfg ports.SpawnConfig, projectConfig domain.ProjectConfig, now time.Time, depth int) domain.SessionRecord {
 	return domain.SessionRecord{
+		PipelineStage:     seedPipelineStage(cfg, projectConfig),
 		ParentSessionID:   cfg.ParentSessionID,
 		Depth:             depth,
 		ProjectID:         cfg.ProjectID,
@@ -5866,6 +5883,22 @@ func seedRecord(cfg ports.SpawnConfig, projectConfig domain.ProjectConfig, now t
 		AutoInjectReview:  true,
 		AutoInjectCI:      true,
 	}
+}
+
+// seedPipelineStage enrolls a worker an orchestrator (or a parent worker)
+// spawned in the mandatory delivery pipeline: it starts at building, attempt 0,
+// when the project's resolved pipeline is enabled. spawn clears
+// cfg.ParentSessionID when the parent was ignored, so a non-empty value here
+// means a live parent. Standalone user sessions and chat sessions keep the
+// legacy empty stage.
+func seedPipelineStage(cfg ports.SpawnConfig, projectConfig domain.ProjectConfig) domain.PipelineStage {
+	if cfg.Kind != domain.KindWorker || cfg.ParentSessionID == "" || domain.NormalizeSessionMode(cfg.RequestedMode) == domain.SessionModeChat {
+		return domain.PipelineStageNone
+	}
+	if !projectConfig.ResolvedPipeline().IsEnabled(true) {
+		return domain.PipelineStageNone
+	}
+	return domain.PipelineStageBuilding
 }
 
 func defaultSessionBranch(id domain.SessionID, kind domain.SessionKind, prefix, branchNamespace string) string {
@@ -6416,6 +6449,12 @@ func (m *Manager) runtimeEnvChecked(id domain.SessionID, project domain.ProjectI
 	deleteProtectedEnv(env, EnvRunFile, caseInsensitive)
 	if runFilePath != "" {
 		env[EnvRunFile] = runFilePath
+	}
+	// The token proves AO_SESSION_ID to the daemon; it is set last-wins here so a
+	// project cannot supply its own, and dropped when no secret is configured.
+	deleteProtectedEnv(env, EnvSessionToken, caseInsensitive)
+	if token := sessionauth.Issue(m.sessionSecret, string(id)); token != "" {
+		env[EnvSessionToken] = token
 	}
 	setProtectedEnv(env, EnvBrowserCapability, "", caseInsensitive)
 	setProtectedEnv(env, EnvBrowserRuntimeToken, "", caseInsensitive)

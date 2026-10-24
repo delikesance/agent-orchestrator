@@ -18,6 +18,9 @@ type NotificationIntent struct {
 	// SourceKey makes one terminal fact idempotent across retries and restarts.
 	SourceKey string
 
+	// Detail is a short, already redacted reason a pipeline escalation carries.
+	Detail string
+
 	// Enrichment hints. These avoid storage reads on the hot path.
 	SessionDisplayName string
 	PRNumber           int

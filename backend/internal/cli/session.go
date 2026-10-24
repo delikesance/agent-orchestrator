@@ -58,8 +58,13 @@ type sessionDTO struct {
 	UpdatedAt    time.Time       `json:"updatedAt"`
 	Status       string          `json:"status"`
 	Branch       string          `json:"branch,omitempty"`
+	Tier         string          `json:"tier,omitempty"`
+	Model        string          `json:"model,omitempty"`
+	Effort       string          `json:"effort,omitempty"`
 	BranchState  *branchStateDTO `json:"branchState,omitempty"`
 	PRs          []sessionPRDTO  `json:"prs"`
+	// Pipeline is the delivery pipeline block; nil for a legacy session.
+	Pipeline *sessionPipelineDTO `json:"pipeline,omitempty"`
 }
 
 type branchStateDTO struct {
@@ -1034,6 +1039,9 @@ func writeSessionDetails(cmd *cobra.Command, sess sessionDTO) error {
 		{"status", sess.Status},
 		{"activity", sess.Activity.State},
 		{"harness", sess.Harness},
+		{"tier", sess.Tier},
+		{"model", sess.Model},
+		{"effort", sess.Effort},
 		{"issue", sess.IssueID},
 		{"branch", formatBranchState(sess)},
 		{"terminated", fmt.Sprintf("%t", sess.IsTerminated)},
@@ -1056,7 +1064,7 @@ func writeSessionDetails(cmd *cobra.Command, sess sessionDTO) error {
 			return err
 		}
 	}
-	return nil
+	return writeSessionPipeline(out, sess.Pipeline)
 }
 
 // formatBranchState renders the daemon's observed branch facts, for example

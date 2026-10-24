@@ -32,6 +32,7 @@ import {
 } from "../hooks/useTerminateSession";
 import { cn } from "../lib/utils";
 import { AgentAvatar } from "./AgentAvatar";
+import { PipelineStageBadge } from "./PipelineStageBadge";
 import { ProductExternalLink } from "./ProductExternalLink";
 import { SessionArchiveDialog, type SessionArchiveChoice } from "./SessionArchiveDialog";
 import { ArtifactPreviewCard } from "./SessionLinkPreviewCard";
@@ -265,6 +266,7 @@ function DesktopSessionCard({
 			externalLink={ProductExternalLink}
 			footer={
 				<>
+					<PipelineStageBadge pipeline={session.pipeline} />
 					{footer}
 				</>
 			}

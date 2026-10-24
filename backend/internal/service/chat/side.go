@@ -464,6 +464,8 @@ func (s *Service) CreateIndependentSideChat(ctx context.Context, id domain.Sessi
 	cfg.Env["AO_SESSION_ID"] = "btw-" + s.sides.launchID() + "-" + idNew
 	cfg.Env["AO_SESSION"] = cfg.Env["AO_SESSION_ID"]
 	delete(cfg.Env, "AO_BROWSER_CAPABILITY")
+	// The parent's session token proves the parent's id, not this side's.
+	delete(cfg.Env, "AO_SESSION_TOKEN")
 	delete(cfg.Env, "AO_PREVIEW_CAPABILITY")
 	// Tool servers inherit the main session's identity too. Rewrite it on a copy
 	// (the main controller still owns the original maps) so a side's `ao` tools,

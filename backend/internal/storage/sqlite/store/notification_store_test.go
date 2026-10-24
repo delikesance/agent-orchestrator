@@ -681,3 +681,28 @@ func TestNotificationStore_MarkNotificationsReadOnlyTouchesGivenIDs(t *testing.T
 		t.Fatalf("unread count = %d err=%v, want 1 (ntf_3 must stay reachable)", count, err)
 	}
 }
+
+// pipeline_escalated has no PR; the notifications CHECK must accept it and a
+// retried-then-escalated-again session must raise a second one.
+func TestNotificationStore_PipelineEscalatedWithoutPR(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "pes")
+	sess, err := s.CreateSession(ctx, sampleRecord("pes"))
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	rec := domain.NotificationRecord{
+		ID: "ntf_pe1", SessionID: sess.ID, ProjectID: sess.ProjectID, Type: domain.NotificationPipelineEscalated,
+		Title: "needs a pipeline decision", Status: domain.NotificationUnread,
+		CreatedAt: time.Now().UTC().Truncate(time.Second), SourceKey: "pipeline_escalated:a:1",
+	}
+	if got, inserted, err := s.CreateNotification(ctx, rec); err != nil || !inserted || got.Type != domain.NotificationPipelineEscalated {
+		t.Fatalf("first escalation = %+v inserted=%v err=%v", got, inserted, err)
+	}
+	next := rec
+	next.ID, next.SourceKey = "ntf_pe2", "pipeline_escalated:a:2"
+	if _, inserted, err := s.CreateNotification(ctx, next); err != nil || !inserted {
+		t.Fatalf("second escalation inserted=%v err=%v", inserted, err)
+	}
+}

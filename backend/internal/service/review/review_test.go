@@ -26,6 +26,7 @@ type fakeStore struct {
 	prComments              map[string][]domain.PullRequestComment
 	sessionAutoInjectReview *bool
 	autoInjectSets          []bool
+	session                 *domain.SessionRecord
 
 	updateCalls        int
 	activityUpdates    int
@@ -87,6 +88,11 @@ func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.S
 	enabled := true
 	if f.sessionAutoInjectReview != nil {
 		enabled = *f.sessionAutoInjectReview
+	}
+	if f.session != nil {
+		rec := *f.session
+		rec.ID, rec.AutoInjectReview = id, enabled
+		return rec, true, nil
 	}
 	return domain.SessionRecord{ID: id, AutoInjectReview: enabled}, true, nil
 }

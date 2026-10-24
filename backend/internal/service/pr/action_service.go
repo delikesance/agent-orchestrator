@@ -59,8 +59,12 @@ type ActionDeps struct {
 	Writer       ports.SCMWriter
 	MergeWriter  mergeStateWriter
 	Lifecycle    actionLifecycle
-	Clock        func() time.Time
-	Logger       *slog.Logger
+	// Pipeline and Sessions turn on merge enforcement together; leave both nil
+	// to keep the merge path unchanged. SetPipelineGuard does the same later.
+	Pipeline PipelineGuard
+	Sessions SessionLookup
+	Clock    func() time.Time
+	Logger   *slog.Logger
 	// ThreadWriter updates one resolved thread and its comments without
 	// replacing a potentially newer SCM observation.
 	ThreadWriter interface {
@@ -77,6 +81,8 @@ type ActionService struct {
 	resolver     ports.SCMReviewResolver
 	mergeWriter  mergeStateWriter
 	lifecycle    actionLifecycle
+	guard        PipelineGuard
+	sessions     SessionLookup
 	clock        func() time.Time
 	logger       *slog.Logger
 	threadWriter interface {
@@ -114,6 +120,8 @@ func NewActionService(deps ActionDeps) *ActionService {
 		resolver:     deps.Resolver,
 		mergeWriter:  deps.MergeWriter,
 		lifecycle:    deps.Lifecycle,
+		guard:        deps.Pipeline,
+		sessions:     deps.Sessions,
 		clock:        clock,
 		logger:       logger,
 		threadWriter: threadWriter,
@@ -141,6 +149,10 @@ func (s *ActionService) Merge(ctx context.Context, request MergeRequest) (MergeR
 	}
 	if !ok || tracked.Number != prNumber {
 		return MergeResult{}, ErrPRNotFound
+	}
+	pipelineWarning, err := s.enforcePipeline(ctx, request, tracked, expectedHead)
+	if err != nil {
+		return MergeResult{}, err
 	}
 	if tracked.Draft || tracked.Merged || tracked.Closed {
 		return MergeResult{}, ErrPRNotMergeable
@@ -205,11 +217,12 @@ func (s *ActionService) Merge(ctx context.Context, request MergeRequest) (MergeR
 		}
 	}
 	return MergeResult{
-		PRNumber:       tracked.Number,
-		Method:         string(ports.SCMMergeSquash),
-		State:          domain.PRStateMerged,
-		MergeCommitSHA: out.MergeCommitSHA,
-		StateChangedAt: mergedAt,
+		PRNumber:        tracked.Number,
+		Method:          string(ports.SCMMergeSquash),
+		State:           domain.PRStateMerged,
+		MergeCommitSHA:  out.MergeCommitSHA,
+		StateChangedAt:  mergedAt,
+		PipelineWarning: pipelineWarning,
 	}, nil
 }
 

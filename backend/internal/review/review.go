@@ -264,6 +264,11 @@ type TriggerOptions struct {
 	// The same reviewer is never started twice on one head at the same time:
 	// a person's rerun reuses that running pass, an agent's rerun is told so.
 	Rerun bool
+	// Target selects what the pass inspects. Empty or ReviewTargetPR reviews the
+	// worker's tracked PRs; ReviewTargetBranch reviews the session branch head
+	// against its base for a session with no PR. The mode is never chosen
+	// implicitly: a PR-less session triggered without it is still rejected.
+	Target ReviewTargetKind
 }
 
 // TriggerWithOptions starts reviews for every PR on the worker session that needs review.
@@ -285,6 +290,13 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 	}
 	if workerID == "" {
 		return TriggerResult{}, fmt.Errorf("%w: worker session id is required", ErrInvalid)
+	}
+	if opts.Target != "" && !opts.Target.Valid() {
+		return TriggerResult{}, fmt.Errorf("%w: unknown review target %q", ErrInvalid, opts.Target)
+	}
+	branchMode := opts.Target == ReviewTargetBranch
+	if branchMode && strings.TrimSpace(opts.PRURL) != "" {
+		return TriggerResult{}, fmt.Errorf("%w: a branch-diff review cannot name a pull request", ErrInvalid)
 	}
 	if override != "" && !override.IsKnown() {
 		return TriggerResult{}, fmt.Errorf("%w: unknown reviewer harness %q", ErrInvalid, override)
@@ -334,8 +346,27 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 	if err != nil {
 		return TriggerResult{}, err
 	}
-	if len(prs) == 0 {
+	var branchTarget *BranchTarget
+	switch {
+	case branchMode:
+		if len(prs) > 0 {
+			return TriggerResult{}, fmt.Errorf("%w: worker %q tracks a PR; review the PR instead of the branch diff", ErrInvalid, workerID)
+		}
+		target, err := e.branchTarget(ctx, worker)
+		if err != nil {
+			return TriggerResult{}, err
+		}
+		branchTarget = &target
+	case len(prs) == 0:
 		return TriggerResult{}, fmt.Errorf("%w: AO is not tracking a PR for worker %q yet; if you just opened one, run `ao review trigger --pr <url>`", ErrInvalid, workerID)
+	}
+	// plan is Plan for the PR mode and PlanBranch for the branch-diff mode, so
+	// everything below treats both as one list of reviewable heads.
+	plan := func(runs []domain.ReviewRun) []PRReviewState {
+		if branchTarget != nil {
+			return PlanBranch(*branchTarget, runs)
+		}
+		return Plan(prs, runs)
 	}
 	if want := strings.TrimSpace(opts.PRURL); want != "" {
 		// A targeted pass reviews only the named PR, matched by API or web URL.
@@ -423,9 +454,9 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 		}
 	}
 	hadRunningReviewer := reviewRunsContainRunningForHarness(runs, harness)
-	reviews := Plan(prs, runs)
+	reviews := plan(runs)
 	if source == domain.ReviewTriggerAuto || opts.Rerun {
-		reviews = Plan(prs, reviewRunsForHarness(runs, harness))
+		reviews = plan(reviewRunsForHarness(runs, harness))
 		// Automatic sweeps may discover another eligible PR while this harness is
 		// already reviewing one. Reconciliation above has proved the reviewer
 		// terminal is still alive, so do not append work to its active batch. A
@@ -609,6 +640,17 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 	queueRuns := append([]domain.ReviewRun{}, restarted...)
 	queueRuns = append(queueRuns, created...)
 	queue := reviewQueue(queueRuns)
+	// withTarget tells the launcher which runs are branch-diff passes so the
+	// prompt names the git diff to inspect instead of a PR.
+	withTarget := func(spec LaunchSpec) LaunchSpec {
+		if branchTarget != nil {
+			spec.BranchTargets = make(map[string]BranchTarget, len(queueRuns))
+			for _, run := range queueRuns {
+				spec.BranchTargets[run.ID] = *branchTarget
+			}
+		}
+		return spec
+	}
 	launchRun := queueRuns[0]
 	launchAgentSessionID := reviewRow.AgentSessionID
 	if hasConfigOverride || selectedMode == domain.ReviewerInterfaceChat {
@@ -664,7 +706,7 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 		if err != nil {
 			return TriggerResult{}, rollbackReplacement(err)
 		}
-		launchSpec := reviewLaunchSpec(worker, harness, config, launchRun, queue, 0, launchAgentSessionID, launchID)
+		launchSpec := withTarget(reviewLaunchSpec(worker, harness, config, launchRun, queue, 0, launchAgentSessionID, launchID))
 		launchSpec.ProjectEnv = projectEnv
 		launchSpec.InterfaceMode = selectedMode
 		launchSpec.DeferInitialMessage = deferInitialMessage
@@ -683,7 +725,7 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 			persistedAgentSessionID = launch.AgentSessionID
 		}
 	} else {
-		launchSpec := reviewLaunchSpec(worker, harness, config, launchRun, queue, 0, reviewRow.AgentSessionID, reviewRow.ReviewerLaunchID)
+		launchSpec := withTarget(reviewLaunchSpec(worker, harness, config, launchRun, queue, 0, reviewRow.AgentSessionID, reviewRow.ReviewerLaunchID))
 		launchSpec.InterfaceMode = selectedMode
 		if err := e.launcher.Notify(ctx, handleID, launchSpec); err != nil {
 			return TriggerResult{}, failRuns(0, fmt.Errorf("notify reviewer: %w", err))
@@ -738,7 +780,7 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 		}
 		previousStopped = true
 		if deferInitialMessage {
-			launchSpec := reviewLaunchSpec(worker, harness, config, launchRun, queue, 0, persistedAgentSessionID, reviewRow.ReviewerLaunchID)
+			launchSpec := withTarget(reviewLaunchSpec(worker, harness, config, launchRun, queue, 0, persistedAgentSessionID, reviewRow.ReviewerLaunchID))
 			launchSpec.InterfaceMode = selectedMode
 			if err := e.launcher.Notify(ctx, handleID, launchSpec); err != nil {
 				return TriggerResult{}, rollbackReplacement(fmt.Errorf("notify replacement reviewer: %w", err))
@@ -804,19 +846,23 @@ func nothingToReviewError(reviews []PRReviewState, runs []domain.ReviewRun, harn
 			continue
 		}
 		sha := shortSHA(review.TargetSHA)
+		subject := fmt.Sprintf("PR #%d head %s", review.PRNumber, sha)
+		if review.PRURL == "" {
+			subject = fmt.Sprintf("branch head %s", sha)
+		}
 		if rerun {
-			return fmt.Errorf("%w: %s is already reviewing PR #%d head %s; wait for it, cancel it with `ao review cancel`, or choose another reviewer with --agent", ErrReviewAlreadyRunning, harness, review.PRNumber, sha)
+			return fmt.Errorf("%w: %s is already reviewing %s; wait for it, cancel it with `ao review cancel`, or choose another reviewer with --agent", ErrReviewAlreadyRunning, harness, subject)
 		}
 		for _, run := range runs {
 			if run.PRURL == review.PRURL && run.TargetSHA == review.TargetSHA && run.Status == domain.ReviewRunRunning {
-				return fmt.Errorf("%w: %s is already reviewing PR #%d head %s; wait for its result, or pass --rerun to add another reviewer", ErrReviewAlreadyRunning, run.Harness, review.PRNumber, sha)
+				return fmt.Errorf("%w: %s is already reviewing %s; wait for its result, or pass --rerun to add another reviewer", ErrReviewAlreadyRunning, run.Harness, subject)
 			}
 		}
 		verdict := "reviewed"
 		if review.LatestRun != nil && review.LatestRun.Verdict != domain.VerdictNone {
 			verdict = string(review.LatestRun.Verdict)
 		}
-		return fmt.Errorf("%w: PR #%d head %s was already reviewed (%s); push new commits, or pass --rerun to review this commit again. If you just pushed, wait a few seconds and run it again", ErrHeadAlreadyReviewed, review.PRNumber, sha, verdict)
+		return fmt.Errorf("%w: %s was already reviewed (%s); push new commits, or pass --rerun to review this commit again. If you just pushed, wait a few seconds and run it again", ErrHeadAlreadyReviewed, subject, verdict)
 	}
 	return fmt.Errorf("%w: no open PR head to review", ErrInvalid)
 }

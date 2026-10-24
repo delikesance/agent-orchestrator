@@ -451,3 +451,30 @@ func TestProjectRemove_YesSkipsConfirmationAndSupportsBackendRemoveEnvelope(t *t
 		t.Fatalf("--yes output should skip prompt and print removal:\n%s", out)
 	}
 }
+
+func TestProjectSetConfig_PreservesUnknownFields(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, capture := projectServer(t, http.StatusOK, `{"project":{"id":"demo","path":"/repo/demo"}}`)
+	writeRunFileFor(t, cfg, srv)
+
+	pipeline := `{"validating":{"commands":["go test ./..."]},"maxAttempts":3}`
+	in := `{"sessionPrefix":"x","pipeline":` + pipeline + `,"futureField":{"a":[1,2]}}`
+	_, errOut, err := executeCLI(t, Deps{
+		ProcessAlive: func(int) bool { return true },
+	}, "project", "set-config", "demo", "--config-json", in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v\nstderr=%s", err, errOut)
+	}
+	var got struct {
+		Config map[string]json.RawMessage `json:"config"`
+	}
+	if err := json.Unmarshal(capture.body, &got); err != nil {
+		t.Fatalf("decode request: %v\nbody=%s", err, capture.body)
+	}
+	if string(got.Config["pipeline"]) != pipeline {
+		t.Fatalf("pipeline = %s, want %s\nbody=%s", got.Config["pipeline"], pipeline, capture.body)
+	}
+	if string(got.Config["futureField"]) != `{"a":[1,2]}` || string(got.Config["sessionPrefix"]) != `"x"` {
+		t.Fatalf("config = %s, want unknown and typed fields kept", capture.body)
+	}
+}

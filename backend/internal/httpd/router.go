@@ -20,6 +20,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/controllers"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 	"github.com/aoagents/agent-orchestrator/backend/internal/telemetrymeta"
 	"github.com/aoagents/agent-orchestrator/backend/internal/terminal"
 )
@@ -42,6 +43,7 @@ type ControlDeps struct {
 //	recoverer     → turn a handler panic into 500 instead of crashing the daemon
 //	accountOrigin → exact renderer-origin boundary for Codex account management
 //	cors          → CORS allowlist for the Electron renderer / dev origins
+//	sessionauth   → record the verified (or unverified) calling session in the context
 //
 // The per-request timeout is deliberately not global: it wraps only bounded
 // REST routes, never long-lived terminal streams or health probes.
@@ -59,6 +61,8 @@ func NewRouterWithControl(cfg config.Config, log *slog.Logger, termMgr *terminal
 	r.Use(codexAccountOriginMiddleware(cfg.AllowedOrigins))
 	r.Use(corsMiddleware(cfg.AllowedOrigins))
 	r.Use(previewOriginMiddleware(api.sessions))
+	// Identify the calling session. Never rejects: see package sessionauth.
+	r.Use(sessionauth.Middleware(deps.SessionSecret, log))
 
 	// JSON envelopes for unmatched routes / methods — chi's defaults are
 	// text/plain, which would break consumers that parse every response as

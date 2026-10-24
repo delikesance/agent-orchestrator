@@ -464,6 +464,13 @@ type SessionView struct {
 	// Model is the agent model this session resolved to at spawn time. Empty
 	// means the agent's default model. Pulled from the json:"-" domain Metadata.
 	Model string `json:"model,omitempty"`
+	// Tier is the worker tier the session launched with (fast, standard, deep).
+	// Omitted when unset; consumers treat empty as standard. Pulled from the
+	// json:"-" domain Metadata.
+	Tier string `json:"tier,omitempty"`
+	// Effort is the reasoning effort resolved with Model at spawn time. Omitted
+	// when unset. Pulled from the json:"-" domain Metadata.
+	Effort string `json:"effort,omitempty"`
 	// LastUserMessageAt is the latest real user-authored task direction time.
 	// Lifecycle and internal automation updates do not advance it.
 	LastUserMessageAt *time.Time `json:"lastUserMessageAt,omitempty"`
@@ -475,6 +482,9 @@ type SessionView struct {
 	LastEventAt   time.Time             `json:"lastEventAt"`
 	PRs           []SessionPRFacts      `json:"prs"`
 	ArtifactFiles []SessionArtifactView `json:"artifactFiles,omitempty"`
+	// Pipeline is the read-only delivery pipeline block. Omitted for legacy
+	// sessions that no gate applies to.
+	Pipeline *SessionPipelineView `json:"pipeline,omitempty"`
 }
 
 // SessionArtifactView is one inferred file artifact for a session.
@@ -2241,7 +2251,7 @@ type NotificationResponse struct {
 	SessionID string    `json:"sessionId"`
 	ProjectID string    `json:"projectId"`
 	PRURL     string    `json:"prUrl"`
-	Type      string    `json:"type" enum:"needs_input,ready_to_merge,pr_merged,pr_closed_unmerged,review_completed,review_changes_requested"`
+	Type      string    `json:"type" enum:"needs_input,ready_to_merge,pr_merged,pr_closed_unmerged,review_completed,review_changes_requested,pipeline_escalated"`
 	Title     string    `json:"title"`
 	Body      string    `json:"body"`
 	Status    string    `json:"status" enum:"unread,read" description:"Seen state. unread means the user has not opened the notification panel since it arrived."`
@@ -2451,6 +2461,9 @@ type MergePRResponse struct {
 	Method         string         `json:"method"`
 	State          domain.PRState `json:"state" enum:"merged"`
 	StateChangedAt time.Time      `json:"stateChangedAt"`
+	// PipelineWarning is set only when the merge was allowed in pipeline warn
+	// mode despite a violation.
+	PipelineWarning string `json:"pipelineWarning,omitempty" description:"Set when the merge was allowed in pipeline warn mode despite a violation; names the violation."`
 }
 
 // ResolveCommentsRequest is the optional body of POST /api/v1/prs/{id}/resolve-comments.
@@ -3575,6 +3588,9 @@ type TriggerReviewRequest struct {
 	RejectReviewedHead bool `json:"rejectReviewedHead,omitempty" description:"Return 409 instead of reusing when every open PR head is already being reviewed or already has a review."`
 	Rerun              bool `json:"rerun,omitempty" description:"Start a fresh pass for already-reviewed current heads; a different reviewer may run alongside one that is still running. A person's rerun reuses an active pass from the same reviewer; an agent's rerun returns 409 REVIEW_ALREADY_RUNNING instead."`
 	EnableAutoInject   bool `json:"enableAutoInject,omitempty" description:"Turn on the worker session's review auto-inject once a pass has started, so the reviewer's PR review comments reach the worker."`
+	// Target selects what the pass reviews. Omitted or "pr" reviews the worker's
+	// pull requests; "branch" reviews the session branch head against its base.
+	Target string `json:"target,omitempty" enum:"pr,branch" description:"What the pass reviews: pr (the worker's pull requests, the default) or branch (the session branch head against its base, for a session with no PR)."`
 }
 
 // ResolveReviewCommentRequest is the body of POST /api/v1/sessions/{sessionId}/reviews/comments/resolve.

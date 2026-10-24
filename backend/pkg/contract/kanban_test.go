@@ -804,3 +804,49 @@ func TestDeriveKanbanPresentationSpeaksForTheChosenPR(t *testing.T) {
 		}
 	})
 }
+
+func TestDeriveKanbanPresentationPipelineStageCeiling(t *testing.T) {
+	t.Parallel()
+	mergeable := []contract.KanbanPRFacts{{URL: "pr/1", Mergeability: contract.MergeMergeable}}
+	merged := []contract.KanbanPRFacts{{URL: "pr/1", Merged: true}}
+	inReview := []contract.KanbanPRFacts{{URL: "pr/1"}}
+	tests := []struct {
+		name          string
+		stage         string
+		terminated    bool
+		prs           []contract.KanbanPRFacts
+		want          contract.KanbanColumn
+		wantEscalated bool
+	}{
+		{name: "legacy empty stage keeps mergeable ready", prs: mergeable, want: contract.KanbanReady},
+		{name: "legacy empty stage no pr building", want: contract.KanbanBuilding},
+		{name: "building caps a mergeable pr", stage: "building", prs: mergeable, want: contract.KanbanBuilding},
+		{name: "validating caps a mergeable pr", stage: "validating", prs: mergeable, want: contract.KanbanValidating},
+		{name: "validating caps a review-cycle pr", stage: "validating", prs: inReview, want: contract.KanbanValidating},
+		{name: "review caps a mergeable pr to the review lane", stage: "review", prs: mergeable, want: contract.KanbanNeedsReview},
+		{name: "review leaves a review-cycle pr", stage: "review", prs: inReview, want: contract.KanbanNeedsReview},
+		{name: "ceiling never promotes", stage: "review", want: contract.KanbanBuilding},
+		{name: "ready allows ready", stage: "ready", prs: mergeable, want: contract.KanbanReady},
+		{name: "merged keeps the merged placement", stage: "merged", prs: merged, want: contract.KanbanReady},
+		{name: "merged terminated archives", stage: "merged", terminated: true, prs: merged, want: contract.KanbanArchive},
+		{name: "escalated stays on its source lane", stage: "escalated", prs: inReview, want: contract.KanbanNeedsReview, wantEscalated: true},
+		{name: "escalated without pr stays building", stage: "escalated", want: contract.KanbanBuilding, wantEscalated: true},
+		{name: "terminated archives under any stage", stage: "validating", terminated: true, prs: inReview, want: contract.KanbanArchive},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			session := contract.KanbanSessionFacts{
+				SessionFacts:  contract.SessionFacts{IsTerminated: tt.terminated},
+				PipelineStage: tt.stage,
+			}
+			got := contract.DeriveKanbanPresentation(session, tt.prs, time.Time{}, 0)
+			if got.Column != tt.want || got.Escalated != tt.wantEscalated {
+				t.Fatalf("got column=%q escalated=%v, want %q/%v", got.Column, got.Escalated, tt.want, tt.wantEscalated)
+			}
+			if got.DisplayStatus == "" {
+				t.Fatal("display status must be set")
+			}
+		})
+	}
+}

@@ -42,6 +42,7 @@ import (
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
 	usagesvc "github.com/aoagents/agent-orchestrator/backend/internal/service/usage"
 	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 	"github.com/aoagents/agent-orchestrator/backend/internal/workspacewatch"
 )
 
@@ -202,6 +203,9 @@ type SessionsController struct {
 	AgentBrowserToken string
 	// ArtifactVersions serves artifact version history; nil leaves those routes unimplemented.
 	ArtifactVersions ArtifactVersionService
+	// Pipeline fills the read-only pipeline block of a session view; nil leaves
+	// every view without one.
+	Pipeline PipelineReader
 }
 
 // Register mounts the session routes on the supplied router.
@@ -300,7 +304,7 @@ func (c *SessionsController) list(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteError(w, r, err)
 		return
 	}
-	envelope.WriteJSON(w, http.StatusOK, ListSessionsResponse{Sessions: sessionViews(r, sessions)})
+	envelope.WriteJSON(w, http.StatusOK, ListSessionsResponse{Sessions: c.sessionViews(r, sessions)})
 }
 
 func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
@@ -368,12 +372,25 @@ func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
 		keyless.Attachments = nil
 		requestHash = clientRequestFingerprint("session", keyless, attachments)
 	}
-	sess, promptBytes, systemPromptBytes, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, ParentSessionID: in.ParentSessionID, TrackerProvider: in.TrackerProvider, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, RequestedMode: in.Mode, Prompt: in.Prompt, RequestedOutput: in.RequestedOutput, Tier: in.Tier, DisplayName: displayName, Attachments: attachments, AgentConfig: ports.AgentConfig{Model: in.Model, Effort: in.Effort, Permissions: in.ApprovalMode}, EffortOverride: strings.TrimSpace(in.Effort) != "", ClientRequestID: in.ClientRequestID, ClientRequestHash: requestHash})
+	// The parent id in the body is only a claim. A caller the daemon verified
+	// (X-AO-Session-Token) is the authority: a body naming another parent is a
+	// forged lineage. An unverified caller keeps the legacy behaviour and the
+	// manager is told the claim is unproven.
+	caller := sessionauth.CallerFromContext(r.Context())
+	parentVerified := false
+	if in.ParentSessionID != "" && caller.Verified {
+		if string(in.ParentSessionID) != caller.SessionID {
+			envelope.WriteAPIError(w, r, http.StatusForbidden, "forbidden", "PARENT_SESSION_MISMATCH", "parentSessionId does not match the authenticated calling session", nil)
+			return
+		}
+		parentVerified = true
+	}
+	sess, promptBytes, systemPromptBytes, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, ParentSessionID: in.ParentSessionID, ParentVerified: parentVerified, TrackerProvider: in.TrackerProvider, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, RequestedMode: in.Mode, Prompt: in.Prompt, RequestedOutput: in.RequestedOutput, Tier: in.Tier, DisplayName: displayName, Attachments: attachments, AgentConfig: ports.AgentConfig{Model: in.Model, Effort: in.Effort, Permissions: in.ApprovalMode}, EffortOverride: strings.TrimSpace(in.Effort) != "", ClientRequestID: in.ClientRequestID, ClientRequestHash: requestHash})
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return
 	}
-	resp := SpawnSessionResponse{Session: sessionView(r, sess), PromptBytes: promptBytes, SystemPromptBytes: systemPromptBytes}
+	resp := SpawnSessionResponse{Session: c.sessionView(r, sess), PromptBytes: promptBytes, SystemPromptBytes: systemPromptBytes}
 	if in.Tier != "" {
 		applied := sess.TierApplied
 		resp.TierApplied = &applied
@@ -501,7 +518,7 @@ func (c *SessionsController) get(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteError(w, r, err)
 		return
 	}
-	envelope.WriteJSON(w, http.StatusOK, SessionResponse{Session: sessionView(r, sess)})
+	envelope.WriteJSON(w, http.StatusOK, SessionResponse{Session: c.sessionView(r, sess)})
 }
 
 func (c *SessionsController) preview(w http.ResponseWriter, r *http.Request) {
@@ -2628,7 +2645,7 @@ func (c *SessionsController) listOrchestrators(w http.ResponseWriter, r *http.Re
 		envelope.WriteError(w, r, err)
 		return
 	}
-	envelope.WriteJSON(w, http.StatusOK, ListSessionsResponse{Sessions: sessionViews(r, sessions)})
+	envelope.WriteJSON(w, http.StatusOK, ListSessionsResponse{Sessions: c.sessionViews(r, sessions)})
 }
 
 func (c *SessionsController) getOrchestrator(w http.ResponseWriter, r *http.Request) {
@@ -2645,7 +2662,7 @@ func (c *SessionsController) getOrchestrator(w http.ResponseWriter, r *http.Requ
 		envelope.WriteAPIError(w, r, http.StatusNotFound, "not_found", "SESSION_NOT_FOUND", "Unknown session", nil)
 		return
 	}
-	envelope.WriteJSON(w, http.StatusOK, SessionResponse{Session: sessionView(r, sess)})
+	envelope.WriteJSON(w, http.StatusOK, SessionResponse{Session: c.sessionView(r, sess)})
 }
 
 func sessionID(r *http.Request) domain.SessionID {
@@ -2885,6 +2902,8 @@ func sessionView(r *http.Request, s domain.Session) SessionView {
 		PreviewURL:         s.Metadata.PreviewURL,
 		PreviewRevision:    s.Metadata.PreviewRevision,
 		Model:              s.Metadata.Model,
+		Tier:               s.Metadata.Tier,
+		Effort:             s.Metadata.Effort,
 		LastUserMessageAt: func() *time.Time {
 			if s.Metadata.LatestUserPromptAt.IsZero() {
 				return nil
@@ -2909,10 +2928,18 @@ func sessionView(r *http.Request, s domain.Session) SessionView {
 	return view
 }
 
-func sessionViews(r *http.Request, sessions []domain.Session) []SessionView {
+// sessionView is the package-level sessionView plus the pipeline block, which
+// needs the pipeline service. Legacy sessions never touch the service.
+func (c *SessionsController) sessionView(r *http.Request, s domain.Session) SessionView {
+	view := sessionView(r, s)
+	view.Pipeline = pipelineView(r.Context(), c.Pipeline, s)
+	return view
+}
+
+func (c *SessionsController) sessionViews(r *http.Request, sessions []domain.Session) []SessionView {
 	out := make([]SessionView, 0, len(sessions))
 	for _, s := range sessions {
-		out = append(out, sessionView(r, s))
+		out = append(out, c.sessionView(r, s))
 	}
 	return out
 }

@@ -127,6 +127,71 @@ type projectConfig struct {
 	// of another field never silently turns it off.
 	WorkersRequestReview bool             `json:"workersRequestReview,omitempty"`
 	Reviewers            []reviewerConfig `json:"reviewers,omitempty"`
+
+	// extra holds config fields the CLI does not model (for example the
+	// daemon's pipeline block) so a set-config or get never drops them.
+	extra map[string]json.RawMessage
+}
+
+// projectConfigAlias drops the custom JSON methods so the typed fields can be
+// encoded and decoded without recursing.
+type projectConfigAlias projectConfig
+
+// projectConfigKnownKeys lists the JSON keys the typed fields own.
+var projectConfigKnownKeys = func() map[string]bool {
+	keys := map[string]bool{}
+	t := reflect.TypeOf(projectConfig{})
+	for i := 0; i < t.NumField(); i++ {
+		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+		if name != "" && name != "-" {
+			keys[name] = true
+		}
+	}
+	return keys
+}()
+
+// UnmarshalJSON decodes the typed fields and keeps every other field verbatim.
+func (c *projectConfig) UnmarshalJSON(data []byte) error {
+	var typed projectConfigAlias
+	if err := json.Unmarshal(data, &typed); err != nil {
+		return err
+	}
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(data, &all); err != nil {
+		return err
+	}
+	for key := range all {
+		if projectConfigKnownKeys[key] {
+			delete(all, key)
+		}
+	}
+	*c = projectConfig(typed)
+	c.extra = nil
+	if len(all) > 0 {
+		c.extra = all
+	}
+	return nil
+}
+
+// MarshalJSON encodes the typed fields and merges the preserved extras back in.
+func (c projectConfig) MarshalJSON() ([]byte, error) {
+	typed, err := json.Marshal(projectConfigAlias(c))
+	if err != nil {
+		return nil, err
+	}
+	if len(c.extra) == 0 {
+		return typed, nil
+	}
+	merged := map[string]json.RawMessage{}
+	if err := json.Unmarshal(typed, &merged); err != nil {
+		return nil, err
+	}
+	for key, value := range c.extra {
+		if _, ok := merged[key]; !ok {
+			merged[key] = value
+		}
+	}
+	return json.Marshal(merged)
 }
 
 // setConfigRequest mirrors the daemon's SetConfigInput body for

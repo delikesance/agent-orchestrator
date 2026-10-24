@@ -12,6 +12,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apispec"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
 	prsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/pr"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionauth"
 )
 
 var prIDPattern = regexp.MustCompile(`^[1-9]\d*$`)
@@ -46,17 +47,23 @@ func (c *PRsController) merge(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_PR", "PR URL and expected head SHA are required", nil)
 		return
 	}
-	res, err := c.Svc.Merge(r.Context(), prsvc.MergeRequest{PRID: prID, PRURL: in.PRURL, ExpectedHeadSHA: in.ExpectedHeadSHA})
+	res, err := c.Svc.Merge(r.Context(), prsvc.MergeRequest{
+		PRID:            prID,
+		PRURL:           in.PRURL,
+		ExpectedHeadSHA: in.ExpectedHeadSHA,
+		Caller:          sessionauth.CallerFromContext(r.Context()),
+	})
 	if err != nil {
 		writePRError(w, r, err)
 		return
 	}
 	envelope.WriteJSON(w, http.StatusOK, MergePRResponse{
-		OK:             true,
-		PRNumber:       res.PRNumber,
-		Method:         res.Method,
-		State:          res.State,
-		StateChangedAt: res.StateChangedAt,
+		OK:              true,
+		PRNumber:        res.PRNumber,
+		Method:          res.Method,
+		State:           res.State,
+		StateChangedAt:  res.StateChangedAt,
+		PipelineWarning: res.PipelineWarning,
 	})
 }
 
@@ -98,6 +105,10 @@ func writePRError(w http.ResponseWriter, r *http.Request, err error) {
 		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "PR_NOT_MERGEABLE", "PR is not mergeable", nil)
 	case errors.Is(err, prsvc.ErrPRHeadChanged):
 		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "PR_HEAD_CHANGED", "PR head changed; refresh before merging", nil)
+	case errors.Is(err, prsvc.ErrPipelineMergeForbidden):
+		envelope.WriteAPIError(w, r, http.StatusForbidden, "forbidden", "PIPELINE_MERGE_FORBIDDEN", "Only an orchestrator of the owning project may merge a pipeline task", nil)
+	case errors.Is(err, prsvc.ErrPipelineNotReady):
+		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "PIPELINE_NOT_READY", "Pipeline task is not ready to merge", nil)
 	case errors.Is(err, prsvc.ErrPRPreconditions):
 		envelope.WriteAPIError(w, r, http.StatusUnprocessableEntity, "unprocessable", "PR_PRECONDITIONS_UNMET", "PR merge preconditions are not met", nil)
 	case errors.Is(err, prsvc.ErrNothingToResolve):

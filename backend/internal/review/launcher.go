@@ -86,6 +86,10 @@ type LaunchSpec struct {
 	ReviewQueue            []ports.ReviewTask
 	ReviewIndex            int
 	InterfaceMode          domain.ReviewerInterfaceMode
+	// BranchTargets marks queued runs (by run id) that review a branch diff
+	// instead of a PR. Such runs have an empty PRURL; the prompt names the git
+	// diff to inspect from this target.
+	BranchTargets map[string]BranchTarget
 	// DeferInitialMessage starts the reviewer without dispatching its review
 	// prompt. The engine uses this while replacing a live reviewer so the old
 	// process can be stopped before the replacement receives executable work.
@@ -425,7 +429,11 @@ func previousReviewHistoryText(runs []domain.ReviewRun) string {
 			fmt.Fprintf(&b, "\n* ... %d older review run(s) omitted.", len(runs)-maxRuns)
 			break
 		}
-		fmt.Fprintf(&b, "\n* %s", run.PRURL)
+		if IsBranchRun(run) {
+			b.WriteString("\n* branch-diff review")
+		} else {
+			fmt.Fprintf(&b, "\n* %s", run.PRURL)
+		}
 		if run.TargetSHA != "" {
 			fmt.Fprintf(&b, " at %s", run.TargetSHA)
 		}

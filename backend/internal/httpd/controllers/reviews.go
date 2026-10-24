@@ -196,6 +196,11 @@ func (c *ReviewsController) trigger(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_JSON", "Invalid JSON body", nil)
 		return
 	}
+	target := reviewcore.ReviewTargetKind(strings.TrimSpace(in.Target))
+	if target != "" && !target.Valid() {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_REVIEW_TARGET", "Review target must be \"pr\" or \"branch\"", nil)
+		return
+	}
 	res, err := c.Svc.TriggerRequested(r.Context(), sessionID(r), reviewsvc.TriggerRequest{
 		Harness:            in.Harness,
 		Config:             in.AgentConfig,
@@ -205,6 +210,7 @@ func (c *ReviewsController) trigger(w http.ResponseWriter, r *http.Request) {
 		RejectReviewedHead: in.RejectReviewedHead,
 		Rerun:              in.Rerun,
 		EnableAutoInject:   in.EnableAutoInject,
+		Target:             target,
 	})
 	if err != nil {
 		writeReviewError(w, r, err)
