@@ -94,8 +94,10 @@ func claudeConfigDir() string {
 }
 
 // ValidateLaunchAuth checks the credential in the exact cwd/environment that
-// will be handed to Claude. Launch validation always bypasses the success cache:
-// a provider can revoke a credential without changing anything on disk.
+// will be handed to Claude. Launch validation bypasses the success cache because
+// a provider can revoke a credential without changing anything on disk. The one
+// exception is an acceptance from the last launchAuthReuse, so back-to-back
+// spawns do not each pay a provider round trip.
 func (p *Plugin) ValidateLaunchAuth(ctx context.Context, workingDir string, env map[string]string) (ports.AgentAuthStatus, error) {
 	return p.authStatusFor(ctx, workingDir, env, true)
 }
@@ -260,7 +262,9 @@ func (p *Plugin) probeResolvedAuthDiagnostics(ctx context.Context, resolved clau
 	}
 	var result agentcreds.Result
 	cached := false
-	if !fresh {
+	if fresh {
+		result, cached = p.authCache().getRecentValid(resolved.credential.Fingerprint(), resolved.provider, launchAuthReuse)
+	} else {
 		result, cached = p.authCache().get(resolved.credential.Fingerprint(), resolved.provider)
 	}
 	started := time.Now()

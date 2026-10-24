@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/pkg/agentcreds"
@@ -619,9 +620,40 @@ func TestLaunchAuthReprobesCachedSuccess(t *testing.T) {
 	if err != nil || status != ports.AgentAuthStatusAuthorized || requests != 1 {
 		t.Fatalf("cached probe setup: status=%q err=%v requests=%d", status, err, requests)
 	}
+	claudeAuthCache.now = func() time.Time { return time.Now().Add(launchAuthReuse + time.Second) }
+	t.Cleanup(func() { claudeAuthCache.now = time.Now })
 	status, err = plugin.ValidateLaunchAuth(context.Background(), "/project", env)
 	if err != nil || status != ports.AgentAuthStatusUnauthorized || requests != 2 {
 		t.Fatalf("fresh launch probe: status=%q err=%v requests=%d, want revoked credential rejection after a second request", status, err, requests)
+	}
+}
+
+func TestLaunchAuthReusesVeryRecentAcceptance(t *testing.T) {
+	clearClaudeCredentialEnv(t)
+	InvalidateAuthCache()
+	t.Cleanup(InvalidateAuthCache)
+
+	requests := 0
+	server := withStubValidator(t, func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		_, _ = w.Write([]byte(`{"data":[{"id":"claude-sonnet-4-6"}]}`))
+	})
+	previous := claudeAuthCommand
+	claudeAuthCommand = func(context.Context, string, string, map[string]string) (claudeCommandOutput, error) {
+		return claudeCommandOutput{Stdout: []byte(`{"loggedIn":true,"apiProvider":"gateway"}`)}, nil
+	}
+	t.Cleanup(func() { claudeAuthCommand = previous })
+
+	plugin := &Plugin{resolvedBinary: "/fixture/claude"}
+	env := map[string]string{"ANTHROPIC_BASE_URL": server.URL, "ANTHROPIC_API_KEY": "same-key"}
+	for i := 0; i < 3; i++ {
+		status, err := plugin.ValidateLaunchAuth(context.Background(), "/project", env)
+		if err != nil || status != ports.AgentAuthStatusAuthorized {
+			t.Fatalf("launch %d: status=%q err=%v", i, status, err)
+		}
+	}
+	if requests != 1 {
+		t.Fatalf("provider requests = %d, want 1 for back-to-back launches", requests)
 	}
 }
 
