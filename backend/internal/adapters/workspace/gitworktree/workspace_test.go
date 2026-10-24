@@ -27,13 +27,13 @@ func TestCommandArgs(t *testing.T) {
 	}{
 		{"check ref", checkRefFormatBranchArgs(repo, branch), []string{"-C", repo, "check-ref-format", "--branch", branch}},
 		{"rev parse", revParseVerifyArgs(repo, "origin/main"), []string{"-C", repo, "rev-parse", "--verify", "--quiet", "origin/main"}},
-		{"add existing", worktreeAddBranchArgs(repo, path, branch, false), []string{"-C", repo, "worktree", "add", path, branch}},
-		{"add new", worktreeAddNewBranchArgs(repo, branch, path, "origin/main", false), []string{"-C", repo, "worktree", "add", "-b", branch, path, "origin/main"}},
+		{"add existing", worktreeAddBranchArgs(repo, path, branch, false), append(worktreeAddArgs(repo), path, branch)},
+		{"add new", worktreeAddNewBranchArgs(repo, branch, path, "origin/main", false), append(worktreeAddArgs(repo), "-b", branch, path, "origin/main")},
 		// --force is git's documented override for a registration whose directory
 		// is gone, and is passed exactly once: `-f -f` would also override an
 		// operator's `git worktree lock`.
-		{"add existing forced", worktreeAddBranchArgs(repo, path, branch, true), []string{"-C", repo, "worktree", "add", "--force", path, branch}},
-		{"add new forced", worktreeAddNewBranchArgs(repo, branch, path, "origin/main", true), []string{"-C", repo, "worktree", "add", "--force", "-b", branch, path, "origin/main"}},
+		{"add existing forced", worktreeAddBranchArgs(repo, path, branch, true), append(worktreeAddArgs(repo), "--force", path, branch)},
+		{"add new forced", worktreeAddNewBranchArgs(repo, branch, path, "origin/main", true), append(worktreeAddArgs(repo), "--force", "-b", branch, path, "origin/main")},
 		// No --force: a dirty worktree must cause `git worktree remove` to fail so
 		// the post-prune safety check surfaces the refusal instead of deleting
 		// uncommitted agent work (review item RA).
