@@ -1172,3 +1172,69 @@ func TestSpawnEffortSurfacesDaemonUnsupportedEffort(t *testing.T) {
 		t.Fatalf("err=%v, want daemon UNSUPPORTED_EFFORT envelope", err)
 	}
 }
+
+func spawnTierServer(t *testing.T, req *spawnRequest, resp string) {
+	t.Helper()
+	cfg := setConfigEnv(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/projects/demo":
+			_, _ = io.WriteString(w, `{"status":"ok","project":{"id":"demo","name":"Demo","path":"/repo/demo"}}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/agents/readiness/ensure":
+			_, _ = io.WriteString(w, authorizedAgentsJSON("claude-code"))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions":
+			if err := json.NewDecoder(r.Body).Decode(req); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = io.WriteString(w, resp)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	writeRunFileFor(t, cfg, srv)
+}
+
+// TestSpawnTierFlagWiring asserts `ao spawn --tier` is serialized as `tier`.
+func TestSpawnTierFlagWiring(t *testing.T) {
+	var req spawnRequest
+	spawnTierServer(t, &req, `{"session":{"id":"demo-22","status":"idle"}}`)
+	_, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "spawn", "--project", "demo", "--agent", "claude-code", "--name", "worker", "--tier", " Fast ")
+	if err != nil {
+		t.Fatalf("spawn failed: %v stderr=%s", err, errOut)
+	}
+	if req.Tier != "fast" {
+		t.Fatalf("spawn request tier = %q, want fast", req.Tier)
+	}
+}
+
+// TestSpawnTierRejectsInvalidValue asserts an unknown tier is a usage error.
+func TestSpawnTierRejectsInvalidValue(t *testing.T) {
+	var req spawnRequest
+	spawnTierServer(t, &req, `{"session":{"id":"demo-22","status":"idle"}}`)
+	_, _, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "spawn", "--project", "demo", "--agent", "claude-code", "--name", "worker", "--tier", "turbo")
+	if err == nil || ExitCode(err) != 2 || !strings.Contains(err.Error(), "--tier") {
+		t.Fatalf("err=%v exit=%d, want --tier usage error", err, ExitCode(err))
+	}
+	if req.Tier != "" {
+		t.Fatalf("invalid tier reached the daemon: %q", req.Tier)
+	}
+}
+
+// TestSpawnPrintsDaemonWarningsToStderr asserts spawn warnings reach stderr
+// and stay out of stdout.
+func TestSpawnPrintsDaemonWarningsToStderr(t *testing.T) {
+	var req spawnRequest
+	spawnTierServer(t, &req, `{"session":{"id":"demo-22","status":"idle"},"warnings":["tier fast not supported by harness"]}`)
+	out, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "spawn", "--project", "demo", "--agent", "claude-code", "--name", "worker", "--tier", "fast")
+	if err != nil {
+		t.Fatalf("spawn failed: %v stderr=%s", err, errOut)
+	}
+	if !strings.Contains(errOut, "warning: tier fast not supported by harness") {
+		t.Fatalf("stderr = %q, want warning", errOut)
+	}
+	if strings.Contains(out, "not supported") {
+		t.Fatalf("warning leaked to stdout: %q", out)
+	}
+}

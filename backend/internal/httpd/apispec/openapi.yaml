@@ -16280,6 +16280,12 @@ components:
           type: string
         taskPreparation:
           type: string
+        tier:
+          enum:
+          - fast
+          - standard
+          - deep
+          type: string
       required:
       - projectId
       - brief
@@ -20321,6 +20327,12 @@ components:
           enum:
           - artifact
           type: string
+        tier:
+          enum:
+          - fast
+          - standard
+          - deep
+          type: string
         trackerProvider:
           enum:
           - github
@@ -20335,6 +20347,14 @@ components:
           $ref: '#/components/schemas/ControllersSessionView'
         systemPromptBytes:
           type: integer
+        tierApplied:
+          type:
+          - "null"
+          - boolean
+        warnings:
+          items:
+            type: string
+          type: array
       required:
       - session
       - promptBytes

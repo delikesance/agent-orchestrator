@@ -63,6 +63,9 @@ var (
 	// selected harness's catalog and the harness does not accept arbitrary model
 	// ids. The API maps it to a 400.
 	ErrUnsupportedModel = errors.New("session: model is not supported by the selected harness")
+	// ErrInvalidTier means the requested worker tier is not fast, standard or
+	// deep. The API maps it to a 400.
+	ErrInvalidTier = errors.New("session: worker tier must be fast, standard or deep")
 	// ErrScratchBranchUnsupported means a caller tried to force git branch
 	// semantics onto a scratch project.
 	ErrScratchBranchUnsupported = errors.New("session: scratch projects do not support branches")
@@ -907,12 +910,16 @@ func New(d Deps) *Manager {
 // parks the row as terminated and rolls back what was built.
 func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, int, int, error) {
 	phases := newSpawnPhases()
-	rec, promptBytes, systemPromptBytes, err := m.spawn(ctx, cfg, phases)
+	var tier tierOutcome
+	rec, promptBytes, systemPromptBytes, err := m.spawn(ctx, cfg, phases, &tier)
 	phases.log(m.logger, cfg.Harness, err)
+	if err == nil {
+		rec.TierApplied, rec.TierWarning = tier.Applied, tier.Warning
+	}
 	return rec, promptBytes, systemPromptBytes, err
 }
 
-func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, phases *spawnPhases) (domain.SessionRecord, int, int, error) {
+func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, phases *spawnPhases, tier *tierOutcome) (domain.SessionRecord, int, int, error) {
 	if cfg.RequestedOutput == domain.RequestedOutputArtifact && m.artifactDir("") == "" {
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", ErrArtifactOutputUnavailable)
 	}
@@ -989,6 +996,18 @@ func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, phases *spaw
 	// model the harness cannot honor should not leave a seed row behind.
 	explicitModel := cfg.AgentConfig.Model != ""
 	agentConfig := applySpawnAgentConfig(effectiveAgentConfig(cfg.Harness, cfg.Kind, project.Config), cfg.AgentConfig)
+	// A worker tier fills only the model/effort the spawn left empty, resolved on
+	// the harness that will actually launch. The merged override then goes
+	// through the same validation and catalog checks as an explicit one.
+	if cfg.Tier != "" && !cfg.Tier.Valid() {
+		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w: %q", ErrInvalidTier, cfg.Tier)
+	}
+	override, outcome := m.applySpawnTier(ctx, cfg, agentConfig)
+	*tier = outcome
+	if outcome.Applied {
+		cfg.AgentConfig = override
+		agentConfig = applySpawnAgentConfig(effectiveAgentConfig(cfg.Harness, cfg.Kind, project.Config), cfg.AgentConfig)
+	}
 	if err := validateSpawnModel(cfg.Harness, agentConfig.Model); err != nil {
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w: %s", ErrUnsupportedModel, err.Error())
 	}

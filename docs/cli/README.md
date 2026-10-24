@@ -141,6 +141,12 @@ daemon validation.
 Standalone spawns require `--agent` because there is no project configuration
 from which to resolve a default harness.
 
+`ao spawn --tier fast|standard|deep` picks a cost tier for the worker (use
+`fast` for small, cheap tasks). It only fills the model/effort that explicit
+`--model`/`--effort` leave empty; `standard` is a no-op and any other value
+exits 2. Daemon `warnings` (e.g. a tier the harness cannot honor) print to
+stderr.
+
 `ao spawn --output artifact` marks a worker whose deliverable is a file rather
 than a pull request. The daemon persists the kind with the session and adds an
 artifact-delivery section to the worker's system prompt, including after

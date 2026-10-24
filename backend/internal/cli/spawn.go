@@ -32,6 +32,7 @@ type spawnOptions struct {
 	model           string
 	output          string
 	effort          string
+	tier            string
 	claimPR         string
 	noTakeover      bool
 	skipAgentCheck  bool
@@ -52,6 +53,7 @@ type spawnRequest struct {
 	Prompt          string `json:"prompt,omitempty"`
 	Model           string `json:"model,omitempty"`
 	Effort          string `json:"effort,omitempty"`
+	Tier            string `json:"tier,omitempty"`
 	RequestedOutput string `json:"requestedOutput,omitempty"`
 	DisplayName     string `json:"displayName"`
 }
@@ -64,6 +66,9 @@ type spawnResult struct {
 	} `json:"session"`
 	PromptBytes       int `json:"promptBytes,omitempty"`
 	SystemPromptBytes int `json:"systemPromptBytes,omitempty"`
+	// Warnings are advisory daemon notes (e.g. a tier that could not be
+	// applied); absent on older daemons.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 func newSpawnCommand(ctx *commandContext) *cobra.Command {
@@ -103,6 +108,10 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 			}
 			if opts.output != "" && opts.kind == "orchestrator" {
 				return usageError{fmt.Errorf("--output is supported for worker sessions only")}
+			}
+			opts.tier = strings.ToLower(strings.TrimSpace(opts.tier))
+			if opts.tier != "" && opts.tier != "fast" && opts.tier != "standard" && opts.tier != "deep" {
+				return usageError{fmt.Errorf(`--tier must be "fast", "standard", or "deep"`)}
 			}
 			if opts.standalone {
 				if opts.kind == "orchestrator" {
@@ -175,6 +184,7 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 				Prompt:          opts.prompt,
 				Model:           strings.TrimSpace(opts.model),
 				Effort:          strings.TrimSpace(opts.effort),
+				Tier:            opts.tier,
 				RequestedOutput: opts.output,
 				DisplayName:     name,
 			}
@@ -196,6 +206,13 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 				}
 				if len(claim.PRs) > 0 {
 					claimed = claim.PRs[0].URL
+				}
+			}
+			for _, w := range res.Warnings {
+				if w = strings.TrimSpace(w); w != "" {
+					if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n", w); err != nil {
+						return err
+					}
 				}
 			}
 			out := cmd.OutOrStdout()
@@ -239,6 +256,7 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 	f.StringVar(&opts.model, "model", "", "Agent model override for this session only (e.g. sonnet, gpt-5.6-sol); overrides project/role config without changing it")
 	f.StringVar(&opts.output, "output", "", "Deliverable for the session: artifact asks the agent to write a file in its artifact directory instead of opening a PR (default: ordinary task)")
 	f.StringVar(&opts.effort, "effort", "", "Reasoning effort override for this session only (e.g. low, medium, high); empty defers to the agent/model default")
+	f.StringVar(&opts.tier, "tier", "", "Worker cost tier: fast (small, cheap tasks), standard (default), or deep; fills only the model/effort that --model/--effort leave unset")
 	f.StringVar(&opts.issue, "issue", "", "Issue id to associate with the session")
 	f.StringVar(&opts.trackerProvider, "tracker-provider", "github", "Issue tracker provider: github or gitlab (default: github)")
 	f.StringVar(&opts.name, "name", "", "Display name shown in the sidebar (required, max 100 characters)")

@@ -5599,6 +5599,8 @@ export interface components {
             model?: string;
             projectId: string;
             taskPreparation?: string;
+            /** @enum {string} */
+            tier?: "fast" | "standard" | "deep";
         };
         DelegateTaskResponse: {
             ok: boolean;
@@ -7177,12 +7179,16 @@ export interface components {
             /** @enum {string} */
             requestedOutput?: "artifact";
             /** @enum {string} */
+            tier?: "fast" | "standard" | "deep";
+            /** @enum {string} */
             trackerProvider?: "github" | "gitlab";
         };
         SpawnSessionResponse: {
             promptBytes: number;
             session: components["schemas"]["ControllersSessionView"];
             systemPromptBytes: number;
+            tierApplied?: null | boolean;
+            warnings?: string[];
         };
         StageSessionAttachmentsRequest: {
             attachments: components["schemas"]["AttachmentInput"][];

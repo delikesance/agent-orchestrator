@@ -250,6 +250,11 @@ type Manager struct {
 	// flights tracks, per session, the in-flight tool executions and the
 	// pending permission dialog's identity (see toolFlight). Guarded by mu.
 	flights map[domain.SessionID]*toolFlight
+	// launchedAt is when MarkSpawned last committed a launch (fresh or restore)
+	// whose first signal is still pending, so the spawn-timing log measures from
+	// the launch and never spans the session's whole life. In-memory only; cleared
+	// at the first signal and on termination.
+	launchedAt map[domain.SessionID]time.Time
 	// steps is each session's recent tool calls for the memory window, from
 	// tool-use hooks (see steps.go). Guarded by mu.
 	steps map[domain.SessionID][]domain.SessionStep
@@ -286,6 +291,7 @@ func New(store sessionStore, messenger ports.AgentMessenger, opts ...Option) *Ma
 		clock:                       clock,
 		react:                       newReactionState(),
 		flights:                     map[domain.SessionID]*toolFlight{},
+		launchedAt:                  map[domain.SessionID]time.Time{},
 		steps:                       map[domain.SessionID][]domain.SessionStep{},
 		pendingLaunches:             map[domain.SessionID]pendingLaunch{},
 		steerActive:                 func(domain.AgentHarness) bool { return false },
@@ -506,6 +512,7 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 		// m.mu — mutate holds it across this callback.
 		delete(m.flights, id)
 		delete(m.steps, id)
+		delete(m.launchedAt, id)
 		terminated = true
 		return next, true
 	})
@@ -635,6 +642,7 @@ retryProjection:
 	if rec.IsTerminated {
 		delete(m.flights, id)
 		delete(m.steps, id)
+		delete(m.launchedAt, id)
 		m.mu.Unlock()
 		return nil
 	}
@@ -1022,7 +1030,8 @@ retryProjection:
 	}
 	next := rec
 	next.Activity = act
-	if next.FirstSignalAt.IsZero() {
+	firstSignal := next.FirstSignalAt.IsZero()
+	if firstSignal {
 		next.FirstSignalAt = timeOr(s.Timestamp, now)
 	}
 	if s.State == domain.ActivityExited {
@@ -1045,6 +1054,17 @@ retryProjection:
 		m.mu.Unlock()
 		return nil
 	}
+	var firstSignalAttrs []any
+	if firstSignal {
+		firstSignalAttrs = []any{"sessionID", id, "harness", rec.Harness}
+		if at, ok := m.launchedAt[id]; ok {
+			delete(m.launchedAt, id)
+			firstSignalAttrs = append(firstSignalAttrs, "first_signal_ms", next.FirstSignalAt.Sub(at).Milliseconds())
+		} else {
+			// Daemon restarted since the launch, or a legacy row: no honest delta.
+			firstSignalAttrs = append(firstSignalAttrs, "first_signal_ms_unknown", true)
+		}
+	}
 	// Transition into the needs-input family (waiting_input or blocked) pings
 	// the user; an in-family escalation (waiting_input -> blocked) does not
 	// re-notify — the user was already pinged once for this pause.
@@ -1062,6 +1082,9 @@ retryProjection:
 	resolutions := needsInputResolutions(rec, next, now)
 	waitingEvents := m.waitingInputEvents(next, prevState, prevAt, now)
 	m.mu.Unlock()
+	if firstSignalAttrs != nil {
+		slog.Default().Info("spawn: first signal", firstSignalAttrs...)
+	}
 	if prevState != domain.ActivityIdle && next.Activity.State == domain.ActivityIdle {
 		m.operationGateMu.RLock()
 		gate := m.operationGate
@@ -1545,6 +1568,8 @@ func (m *Manager) markSpawned(
 				return nil, err
 			}
 		}
+		// Only after the durable write succeeded, so a failed launch leaves no entry.
+		m.launchedAt[id] = now
 		return m.usageReactivator, nil
 	}()
 	if err != nil {
@@ -1730,6 +1755,7 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 				cur.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: now}
 				delete(m.flights, id) // runs under m.mu (mutate holds it)
 				delete(m.steps, id)
+				delete(m.launchedAt, id)
 				outcome = terminationApplied
 				return cur, true
 			}

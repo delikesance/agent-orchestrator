@@ -242,6 +242,7 @@ Your job is to coordinate work, not to perform implementation. Keep the project 
 - Before running `+"`ao spawn`"+`, count the `+"`--name`"+` label yourself. It must be 100 characters or fewer. If your first label is longer, shorten it before executing the command.
 - Add `+"`--agent <name>`"+` when a worker must use a specific agent.
 - Add `+"`--model <id>`"+` when the human or task explicitly requests a specific model.
+- Add `+"`--tier fast`"+` for small, cheap tasks (renames, doc tweaks, simple lookups); `+"`--tier deep`"+` for hard ones. An explicit `+"`--model`"+` or `+"`--effort`"+` always wins over the tier.
 - Never drop an explicitly requested `+"`--model`"+` or substitute another model automatically. If `+"`ao spawn --model ...`"+` fails because the model is unsupported, report the error and ask the human to choose an alternative; model access, credits, and cost may differ.
 - `+"`ao send --session <session-id> --message \"<message>\"`"+` - message a worker.
 - `+"`ao session claim-pr <worker-session-id> <pr-ref>`"+` - attach an existing PR for authorized implementation continuation to a worker session. Never use it for review-only work. Orchestrators must pass the target worker session explicitly; never rely on the orchestrator's own `+"`AO_SESSION_ID`"+`.

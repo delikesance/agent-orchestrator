@@ -531,6 +531,9 @@ type SpawnSessionRequest struct {
 	Model string `json:"model,omitempty" maxLength:"256"`
 	// Effort is the optional reasoning level for the selected model.
 	Effort string `json:"effort,omitempty" maxLength:"32"`
+	// Tier is an optional speed/depth hint resolved to a model and effort by the
+	// daemon. Explicit model or effort overrides win over it.
+	Tier domain.WorkerTier `json:"tier,omitempty" enum:"fast,standard,deep"`
 
 	// RequestedOutput asks for a specific deliverable. artifact tells the worker to
 	// write a file in its artifact directory instead of opening a PR. Omitted is
@@ -570,6 +573,13 @@ type SpawnSessionResponse struct {
 	Session           SessionView `json:"session"`
 	PromptBytes       int         `json:"promptBytes"`
 	SystemPromptBytes int         `json:"systemPromptBytes"`
+	// TierApplied reports whether the requested tier chose the model or effort.
+	// It is present (true or false) whenever the request named a tier and absent
+	// otherwise, so a tier that was not applied stays distinct from no tier
+	// requested. Warnings is likewise present only when the request named a tier.
+	TierApplied *bool `json:"tierApplied,omitempty"`
+	// Warnings explain why a requested tier was only partly honored.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // StageSessionAttachmentsRequest attaches files to a session that is already
@@ -1238,6 +1248,9 @@ type DelegateTaskRequest struct {
 	// TaskPreparation is the opaque worktree token returned while the New Task
 	// dialog is open. Missing or expired tokens fall back to normal creation.
 	TaskPreparation string `json:"taskPreparation,omitempty"`
+	// Tier is an optional speed/depth hint resolved to a model and effort by the
+	// daemon; an explicit model or effort wins over it.
+	Tier domain.WorkerTier `json:"tier,omitempty" enum:"fast,standard,deep"`
 }
 
 // PrepareTaskResponse returns the opaque token for a speculative task workspace.

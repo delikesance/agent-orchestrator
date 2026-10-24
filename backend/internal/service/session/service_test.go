@@ -3149,6 +3149,29 @@ func TestSpawnStandaloneWorkerDoesNotRequireProject(t *testing.T) {
 	}
 }
 
+func TestSpawnMapsInvalidTierTo400AndCarriesTierOutcome(t *testing.T) {
+	st := newFakeStore()
+	fc := &fakeCommander{spawnErr: fmt.Errorf("spawn: %w: %q", sessionmanager.ErrInvalidTier, "turbo")}
+	svc := &Service{manager: fc, store: st}
+	_, _, _, err := svc.Spawn(context.Background(), ports.SpawnConfig{Kind: domain.KindWorker, Harness: domain.HarnessCodex, Tier: "turbo"})
+	var e *apierr.Error
+	if !errors.As(err, &e) || e.Kind != apierr.KindInvalid || e.Code != "INVALID_TIER" {
+		t.Fatalf("err = %v, want apierr.Invalid INVALID_TIER", err)
+	}
+
+	fc = &fakeCommander{spawnRecord: domain.SessionRecord{
+		ID: "tier-1", Kind: domain.KindWorker, Harness: domain.HarnessCodex, TierApplied: true, TierWarning: "w",
+	}}
+	svc = &Service{manager: fc, store: st}
+	sess, _, _, err := svc.Spawn(context.Background(), ports.SpawnConfig{Kind: domain.KindWorker, Harness: domain.HarnessCodex, Tier: domain.TierFast})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if !sess.TierApplied || sess.TierWarning != "w" {
+		t.Fatalf("tier outcome = (%v, %q), want carried from the record", sess.TierApplied, sess.TierWarning)
+	}
+}
+
 func TestSpawnStandaloneRejectsProjectFeatures(t *testing.T) {
 	for _, cfg := range []ports.SpawnConfig{
 		{Kind: domain.KindOrchestrator, Harness: domain.HarnessCodex},

@@ -53,6 +53,9 @@ type SpawnConfig struct {
 	// AgentAccountID is the provider account the agent runs under. Empty uses
 	// the provider's default account.
 	AgentAccountID string
+	// Tier is an optional request-scoped speed/depth hint. Empty means absent.
+	// Resolution to model and effort happens in the session manager.
+	Tier domain.WorkerTier
 
 	// RequestedMode is the caller's explicit session mode, or empty to let the
 	// daemon resolve its default. It is validated and persisted before any

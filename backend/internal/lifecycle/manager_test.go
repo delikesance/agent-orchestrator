@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"regexp"
+	"strconv"
 	"slices"
 	"strings"
 	"testing"
@@ -3640,6 +3642,105 @@ func TestActivity_FirstSignalStampsReceipt(t *testing.T) {
 	}
 	if got := st.sessions["mer-1"]; !got.FirstSignalAt.Equal(stamped) {
 		t.Fatalf("first signal moved: %v -> %v", stamped, got.FirstSignalAt)
+	}
+}
+
+func captureSlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+	return &logs
+}
+
+var firstSignalMsRe = regexp.MustCompile(`first_signal_ms=(\d+)`)
+
+func TestActivity_FirstSignalLogsSpawnTimingOnce(t *testing.T) {
+	logs := captureSlog(t)
+	m, st, _ := newManager()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Harness: "claude-code", CreatedAt: time.Now().Add(-time.Hour), Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: time.Now()}}
+	if err := m.MarkSpawned(ctx, "mer-1", domain.SessionMetadata{RuntimeLaunchID: "launch-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyActivitySignal(ctx, "mer-1", ports.ActivitySignal{Valid: true, State: domain.ActivityIdle, LaunchID: "launch-1", Timestamp: time.Now().Add(2 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	got := logs.String()
+	mm := firstSignalMsRe.FindStringSubmatch(got)
+	if n := strings.Count(got, "spawn: first signal"); n != 1 || mm == nil || !strings.Contains(got, "harness=claude-code") || strings.Contains(got, "restore=") || strings.Contains(got, "first_signal_ms_unknown") {
+		t.Fatalf("first hook log = %q", got)
+	}
+	if ms, _ := strconv.Atoi(mm[1]); ms > 60_000 {
+		t.Fatalf("first_signal_ms = %d, want measured from launch, not CreatedAt", ms)
+	}
+	logs.Reset()
+	if err := m.ApplyActivitySignal(ctx, "mer-1", ports.ActivitySignal{Valid: true, State: domain.ActivityActive, LaunchID: "launch-1", Timestamp: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(logs.String(), "spawn: first signal") {
+		t.Fatalf("second hook logged: %q", logs.String())
+	}
+}
+
+func TestActivity_FirstSignalRestoreMeasuredFromRelaunch(t *testing.T) {
+	logs := captureSlog(t)
+	m, st, _ := newManager()
+	rec := working("mer-1")
+	rec.Harness = "claude-code"
+	rec.CreatedAt = time.Now().Add(-24 * time.Hour)
+	rec.FirstSignalAt = time.Now().Add(-23 * time.Hour)
+	rec.IsTerminated = true
+	st.sessions["mer-1"] = rec
+	if err := m.MarkSpawned(ctx, "mer-1", domain.SessionMetadata{RuntimeLaunchID: "launch-2"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyActivitySignal(ctx, "mer-1", ports.ActivitySignal{Valid: true, State: domain.ActivityIdle, LaunchID: "launch-2", Timestamp: time.Now().Add(2 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	got := logs.String()
+	mm := firstSignalMsRe.FindStringSubmatch(got)
+	if strings.Count(got, "spawn: first signal") != 1 || mm == nil {
+		t.Fatalf("restore log = %q", got)
+	}
+	if ms, _ := strconv.Atoi(mm[1]); ms > 60_000 {
+		t.Fatalf("restore first_signal_ms = %d, want measured from relaunch", ms)
+	}
+}
+
+func TestActivity_FirstSignalWithoutLaunchEntryLogsUnknown(t *testing.T) {
+	logs := captureSlog(t)
+	m, st, _ := newManager()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Harness: "claude-code", CreatedAt: time.Now().Add(-time.Hour), Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: time.Now()}}
+	if err := m.ApplyActivitySignal(ctx, "mer-1", ports.ActivitySignal{Valid: true, State: domain.ActivityIdle}); err != nil {
+		t.Fatal(err)
+	}
+	got := logs.String()
+	if strings.Count(got, "spawn: first signal") != 1 || !strings.Contains(got, "first_signal_ms_unknown=true") || strings.Contains(got, "first_signal_ms=") {
+		t.Fatalf("no-entry log = %q", got)
+	}
+}
+
+func TestMarkTerminatedClearsLaunchEntry(t *testing.T) {
+	m, st, _ := newManager()
+	st.sessions["mer-1"] = working("mer-1")
+	if err := m.MarkSpawned(ctx, "mer-1", domain.SessionMetadata{RuntimeLaunchID: "launch-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	_, had := m.launchedAt["mer-1"]
+	m.mu.Unlock()
+	if !had {
+		t.Fatal("MarkSpawned did not record launch time")
+	}
+	if err := m.MarkTerminated(ctx, "mer-1"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	_, has := m.launchedAt["mer-1"]
+	m.mu.Unlock()
+	if has {
+		t.Fatal("terminate left launchedAt entry")
 	}
 }
 

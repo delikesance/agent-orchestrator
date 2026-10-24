@@ -301,6 +301,11 @@ type SessionRecord struct {
 	// surfaces as StatusNoSignal after a grace period. Internal fact, not part
 	// of the API read model.
 	FirstSignalAt time.Time `json:"-"`
+	// TierApplied and TierWarning are set only on the record a spawn returns:
+	// whether the requested worker tier supplied a model or effort, and why a
+	// fast or deep tier changed nothing. They are not persisted.
+	TierApplied   bool      `json:"-"`
+	TierWarning   string    `json:"-"`
 	IsTerminated  bool      `json:"isTerminated"`
 	// HibernatedAt records that the idle Chat controller was stopped while the
 	// session and conversation remain resumable. Nil means no recorded hibernation.
