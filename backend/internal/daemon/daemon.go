@@ -122,7 +122,7 @@ func Run(buildVersion string) error {
 	}
 	ignoreBrokenPipeSignal()
 
-	log := newLogger()
+	log := newLogger(cfg.DataDir)
 	var browserRuntimeToken string
 	if os.Getenv(browserruntime.RuntimeTokenStdinEnv) == "1" {
 		browserRuntimeToken, err = browserruntime.ReadRuntimeToken(os.Stdin)
@@ -1382,12 +1382,6 @@ func usagePipelineWatchRoots(roots usagesvc.SourceRoots) []string {
 		roots.CodexArchived,
 		roots.KimiHome,
 	}
-}
-
-// newLogger returns the daemon's slog logger. It writes to stderr so supervisors
-// can capture it separately from any structured stdout protocol added later.
-func newLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
 // lockDataDir takes the data-dir lock. When another AO process holds it, as a

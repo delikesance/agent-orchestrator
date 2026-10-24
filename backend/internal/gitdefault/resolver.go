@@ -147,6 +147,9 @@ func (r *Resolver) Resolve(ctx, remoteCtx context.Context, repo string) (Resolut
 	if remoteCtx == nil {
 		remoteCtx = ctx
 	}
+	if recent, ok := recentResolution(repo, remote); ok {
+		return recent, nil
+	}
 
 	branch, liveErr := r.liveRemoteHead(remoteCtx, repo, remote)
 	if liveErr == nil {
@@ -159,7 +162,9 @@ func (r *Resolver) Resolve(ctx, remoteCtx context.Context, repo string) (Resolut
 				if err := r.setCachedRemoteHead(ctx, repo, remote, branch); err != nil {
 					return Resolution{}, err
 				}
-				return Resolution{Branch: branch, Remote: remote, Ref: ref, Source: SourceLiveRemoteHead}, nil
+				live := Resolution{Branch: branch, Remote: remote, Ref: ref, Source: SourceLiveRemoteHead}
+				rememberResolution(repo, remote, live)
+				return live, nil
 			}
 			liveErr = fmt.Errorf("fetch remote default %q from %q: %w", branch, remote, fetchErr)
 			// The live lookup still authoritatively named the branch. If that
