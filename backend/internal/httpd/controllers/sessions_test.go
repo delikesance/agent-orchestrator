@@ -97,7 +97,8 @@ type fakeSessionService struct {
 	workspaceViewHistory       *sessionsvc.WorkspaceHistory
 	workspaceBranches          sessionsvc.WorkspaceBranches
 	spawnErr                   error
-	lastSpawn                  ports.SpawnConfig
+	lastListFilter             sessionsvc.ListFilter
+	lastSpawn                 ports.SpawnConfig
 	tierApplied                bool
 	tierWarning                string
 	orchestratorMode           domain.SessionMode
@@ -250,8 +251,12 @@ func newFakeSessionService() *fakeSessionService {
 
 func (f *fakeSessionService) List(_ context.Context, filter sessionsvc.ListFilter) ([]domain.Session, error) {
 	var out []domain.Session
+	f.lastListFilter = filter
 	for _, s := range f.sessions {
 		if filter.ProjectID != "" && s.ProjectID != filter.ProjectID {
+			continue
+		}
+		if filter.ParentSessionID != "" && s.ParentSessionID != filter.ParentSessionID {
 			continue
 		}
 		if filter.Active != nil && s.IsTerminated == *filter.Active {
@@ -1850,6 +1855,54 @@ func TestSessionsAPI_SpawnReportsTierOutcomeOnlyWhenRequested(t *testing.T) {
 	mustJSON(t, body, &unapplied)
 	if len(unapplied.Warnings) != 1 || unapplied.Warnings[0] != svc.tierWarning {
 		t.Fatalf("warnings = %v, want the tier warning; body=%s", unapplied.Warnings, body)
+	}
+}
+
+func TestSessionsAPI_SpawnGuardrailErrorsAre409(t *testing.T) {
+	for _, code := range []string{"SPAWN_DEPTH_EXCEEDED", "TOO_MANY_CHILDREN", "TOO_MANY_WORKERS", "TIER_EXCEEDS_PARENT", "INVALID_PARENT"} {
+		t.Run(code, func(t *testing.T) {
+			svc := newFakeSessionService()
+			svc.spawnErr = apierr.Conflict(code, "limit reached: 4 active, max 4", nil)
+			srv := newSessionTestServer(t, svc)
+			body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions",
+				`{"projectId":"ao","harness":"codex","prompt":"fix"}`)
+			assertErrorCode(t, body, status, http.StatusConflict, code)
+		})
+	}
+}
+
+func TestSessionsAPI_ListFiltersByParentSessionID(t *testing.T) {
+	svc := newFakeSessionService()
+	svc.sessions["ao-parent"] = domain.Session{SessionRecord: domain.SessionRecord{ID: "ao-parent", ProjectID: "ao", Kind: domain.KindWorker}}
+	svc.sessions["ao-kid"] = domain.Session{SessionRecord: domain.SessionRecord{ID: "ao-kid", ProjectID: "ao", Kind: domain.KindWorker, ParentSessionID: "ao-parent", Depth: 1}}
+	svc.sessions["ao-other"] = domain.Session{SessionRecord: domain.SessionRecord{ID: "ao-other", ProjectID: "ao", Kind: domain.KindWorker}}
+	srv := newSessionTestServer(t, svc)
+
+	ids := func(path string) []string {
+		body, status, _ := doRequest(t, srv, http.MethodGet, path, "")
+		if status != http.StatusOK {
+			t.Fatalf("GET %s = %d; body=%s", path, status, body)
+		}
+		var got struct {
+			Sessions []struct {
+				ID string `json:"id"`
+			} `json:"sessions"`
+		}
+		mustJSON(t, body, &got)
+		out := make([]string, 0, len(got.Sessions))
+		for _, g := range got.Sessions {
+			out = append(out, g.ID)
+		}
+		return out
+	}
+	if got := ids("/api/v1/sessions?parentSessionId=ao-parent"); len(got) != 1 || got[0] != "ao-kid" {
+		t.Fatalf("filtered ids = %v, want [ao-kid]", got)
+	}
+	if svc.lastListFilter.ParentSessionID != "ao-parent" {
+		t.Fatalf("filter = %#v", svc.lastListFilter)
+	}
+	if got := ids("/api/v1/sessions"); len(got) != 4 {
+		t.Fatalf("unfiltered ids = %v, want 4", got)
 	}
 }
 

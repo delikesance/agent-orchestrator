@@ -25,6 +25,8 @@ type sessionListOptions struct {
 	sessionOptions
 	all               bool
 	includeTerminated bool
+	children          bool
+	parent            string
 }
 
 type sessionCleanupOptions struct {
@@ -217,14 +219,30 @@ func newSessionCommand(ctx *commandContext) *cobra.Command {
 func newSessionListCommand(ctx *commandContext) *cobra.Command {
 	var opts sessionListOptions
 	cmd := &cobra.Command{
-		Use:   "ls",
+		Use:   "ls [<id>]",
 		Short: "List sessions",
-		Args:  noArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
+		Long:  "List sessions. With --children, list only the direct children of a session: <id> if given, else $AO_SESSION_ID.",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 && !opts.children {
+				return usageError{errors.New("a session id is only accepted with --children")}
+			}
+			if opts.children {
+				parent := os.Getenv("AO_SESSION_ID")
+				if len(args) > 0 {
+					parent = args[0]
+				}
+				parent, err := normalizeSessionID(parent)
+				if err != nil {
+					return err
+				}
+				opts.parent = parent
+			}
 			return ctx.listSessions(cmd.Context(), cmd, opts)
 		},
 	}
 	f := cmd.Flags()
+	f.BoolVar(&opts.children, "children", false, "List direct children of <id> (default $AO_SESSION_ID)")
 	addSessionProjectFlag(f, &opts.project, "Filter by project ID")
 	f.BoolVarP(&opts.all, "all", "a", false, "Include orchestrator sessions")
 	f.BoolVar(&opts.includeTerminated, "include-terminated", false, "Include terminated sessions")
@@ -501,6 +519,9 @@ func (c *commandContext) listSessions(ctx context.Context, cmd *cobra.Command, o
 	}
 	if !opts.includeTerminated {
 		params.Set("active", "true")
+	}
+	if opts.parent != "" {
+		params.Set("parentSessionId", opts.parent)
 	}
 	var res sessionListResponse
 	if err := c.getJSON(ctx, apiPath("sessions", params), &res); err != nil {

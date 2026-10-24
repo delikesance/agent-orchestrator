@@ -5069,3 +5069,45 @@ func TestScopedPostAgentRefreshesIdleProofWithoutStateTransition(t *testing.T) {
 		})
 	}
 }
+
+type fakeTerminationObserver struct{ ids []domain.SessionID }
+
+func (f *fakeTerminationObserver) OnSessionTerminated(_ context.Context, id domain.SessionID) {
+	f.ids = append(f.ids, id)
+}
+
+func TestMarkTerminatedNotifiesObserverOncePerSession(t *testing.T) {
+	m, st, _ := newManager()
+	obs := &fakeTerminationObserver{}
+	m.SetTerminationObserver(obs)
+	st.sessions["mer-1"] = working("mer-1")
+	for i := 0; i < 2; i++ {
+		if err := m.MarkTerminated(ctx, "mer-1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(obs.ids) != 1 || obs.ids[0] != "mer-1" {
+		t.Fatalf("observer calls = %v, want exactly one for mer-1", obs.ids)
+	}
+}
+
+func TestReaperDeathNotifiesTerminationObserverOnce(t *testing.T) {
+	m, st, _ := newManager()
+	obs := &fakeTerminationObserver{}
+	m.SetTerminationObserver(obs)
+	rec := working("mer-1")
+	rec.Activity.LastActivityAt = time.Now().Add(-2 * time.Minute)
+	st.sessions["mer-1"] = rec
+	facts := ports.RuntimeFacts{Runtime: ports.ProbeDead, Workload: ports.ProbeFailed}
+	for i := 0; i < 2; i++ {
+		if err := m.ApplyRuntimeObservation(ctx, "mer-1", facts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !st.sessions["mer-1"].IsTerminated {
+		t.Fatal("reaper observation did not terminate the session")
+	}
+	if len(obs.ids) != 1 {
+		t.Fatalf("observer calls = %v, want exactly one", obs.ids)
+	}
+}

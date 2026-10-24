@@ -166,6 +166,9 @@ const (
 type SessionMetadata struct {
 	// Permissions pins the resolved launch policy independently of future project defaults.
 	Permissions PermissionMode `json:"permissions,omitempty"`
+	// Tier is the worker tier the session launched with (fast, standard, deep).
+	// Empty means none was recorded and reads as standard.
+	Tier string `json:"tier,omitempty"`
 
 	Branch            string `json:"branch,omitempty"`
 	WorkspacePath     string `json:"workspacePath,omitempty"`
@@ -307,6 +310,12 @@ type SessionRecord struct {
 	TierApplied   bool      `json:"-"`
 	TierWarning   string    `json:"-"`
 	IsTerminated  bool      `json:"isTerminated"`
+	// ParentSessionID is the session that spawned this one; empty for a
+	// top-level session. Fixed at insertion and read-only in the API.
+	ParentSessionID SessionID `json:"parentSessionId,omitempty"`
+	// Depth is the spawn distance from the orchestrator (orchestrator 0, its
+	// workers 1, their children 2). Fixed at insertion and read-only in the API.
+	Depth int `json:"depth"`
 	// HibernatedAt records that the idle Chat controller was stopped while the
 	// session and conversation remain resumable. Nil means no recorded hibernation.
 	HibernatedAt *time.Time `json:"hibernatedAt,omitempty"`

@@ -64,7 +64,7 @@ addresses change on restart.
 | `ao automation create/list/get/update/delete/runs` | `POST/GET/PATCH/DELETE /api/v1/automations` |
 | `ao cue create/list`                | `POST/GET /api/v1/projects/{id}/cues`         |
 | `ao spawn`                          | Targeted launch ensure, then `POST /api/v1/sessions` |
-| `ao session ls`                     | `GET /api/v1/sessions` plus per-session PR summaries; shows branch, PR, CI, review, unresolved threads, activity, and age. |
+| `ao session ls [--children [<id>]]` | `GET /api/v1/sessions` (`--children` adds `parentSessionId`) plus per-session PR summaries; shows branch, PR, CI, review, unresolved threads, activity, and age. |
 | `ao session get <id>`               | `GET /api/v1/sessions/{id}`                    |
 | `ao session kill <id>`              | `POST /api/v1/sessions/{id}/kill`              |
 | `ao session restore <id>`           | `POST /api/v1/sessions/{id}/restore`           |
@@ -146,6 +146,18 @@ from which to resolve a default harness.
 `--model`/`--effort` leave empty; `standard` is a no-op and any other value
 exits 2. Daemon `warnings` (e.g. a tier the harness cannot honor) print to
 stderr.
+
+Nested spawns: when `AO_SESSION_ID` is set, the new session is a child of that
+session and always branches from the project base branch (there is no
+`--base-parent`). `ao session ls --children [<id>]` lists only the direct
+children of `<id>`, defaulting to `$AO_SESSION_ID`; passing an id without
+`--children` exits 2. The daemon enforces global caps: nesting depth 2
+(orchestrator = 0), 4 live children per parent and 12 live workers per project
+(`DefaultMaxSpawnDepth`, `DefaultMaxActiveChildren`, `DefaultMaxActiveWorkers`).
+A refused spawn is HTTP 409; `ao spawn` prints the daemon message and code on
+stderr and exits 1. Codes: `SPAWN_DEPTH_EXCEEDED`, `TOO_MANY_CHILDREN`,
+`TOO_MANY_WORKERS`, `TIER_EXCEEDS_PARENT` (child tier above its parent's) and
+`INVALID_PARENT`.
 
 `ao spawn --output artifact` marks a worker whose deliverable is a file rather
 than a pull request. The daemon persists the kind with the session and adds an

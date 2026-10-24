@@ -621,6 +621,11 @@ func Run(buildVersion string) error {
 	sessMgr.SetTerminalInputGate(termMgr)
 	lifecycleMessenger.Bind(sessionLifecycleMessenger{sessMgr})
 	lcStack.LCM.SetCompletionTerminator(sessMgr)
+	if observer, ok := sessMgr.(interface {
+		OnSessionTerminated(context.Context, domain.SessionID)
+	}); ok {
+		lcStack.LCM.SetTerminationObserver(observer)
+	}
 	lcStack.LCM.SetSessionInputLease(sessMgr)
 	lcStack.LCM.SetSessionOperationGate(sessMgr)
 	termMgr.SetSessionInputLease(sessMgr)
@@ -630,9 +635,16 @@ func Run(buildVersion string) error {
 		return errors.New("wire report delivery: session manager lacks semantic send support")
 	}
 	var reportCoordinator *reportsvc.Coordinator
-	reportSvc := reportsvc.New(reportsvc.Deps{Store: store, Artifacts: chatSvc, OnCreated: func(domain.ReportRecord) {
+	childDone, _ := sessMgr.(interface {
+		OnChildReportedDone(context.Context, domain.SessionID)
+	})
+	reportSvc := reportsvc.New(reportsvc.Deps{Store: store, Artifacts: chatSvc, OnCreated: func(rec domain.ReportRecord) {
 		if reportCoordinator != nil {
 			reportCoordinator.Wake()
+		}
+		// A done report does not end the session; tell a live parent once.
+		if rec.State == domain.ReportDone && childDone != nil {
+			childDone.OnChildReportedDone(context.WithoutCancel(ctx), rec.SessionID)
 		}
 	}})
 	reportCoordinator = reportsvc.NewCoordinator(reportsvc.CoordinatorDeps{

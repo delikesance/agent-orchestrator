@@ -731,6 +731,9 @@ type Session struct {
 	LaunchOptions                    string
 	BranchNaming                     bool
 	TemporaryBranch                  string
+	ParentSessionID                  string
+	SpawnDepth                       int64
+	Tier                             string
 }
 
 type SessionAgentAccount struct {

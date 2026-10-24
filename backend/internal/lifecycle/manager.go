@@ -126,6 +126,13 @@ type sessionTerminator interface {
 	Kill(ctx context.Context, id domain.SessionID) (bool, error)
 }
 
+// terminationObserver is the narrow port to Session Manager's end-of-session
+// hook (child cascade and parent report). It is late-bound for the same reason
+// as completionTerminator: Session Manager depends on this package.
+type terminationObserver interface {
+	OnSessionTerminated(ctx context.Context, id domain.SessionID)
+}
+
 type sessionUsageFinalizer interface {
 	FinalizeSession(
 		ctx context.Context,
@@ -229,6 +236,9 @@ type Manager struct {
 	// completionTerminator is late-bound because Session Manager itself depends
 	// on this lifecycle reducer. It is required before the SCM observer starts.
 	completionTerminator sessionTerminator
+	// terminationObserver fires once per session, on the transition to
+	// terminated only (never on an already-terminated no-op).
+	terminationObserver terminationObserver
 	// usageFinalizer is late-bound because the usage pipeline is optional. It
 	// receives terminal intent before is_terminated makes the session ineligible
 	// for normal source discovery.
@@ -316,6 +326,22 @@ func (m *Manager) SetCompletionTerminator(terminator sessionTerminator) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.completionTerminator = terminator
+}
+
+// SetTerminationObserver wires the once-per-session end-of-session hook.
+func (m *Manager) SetTerminationObserver(observer terminationObserver) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.terminationObserver = observer
+}
+
+func (m *Manager) notifyTerminated(ctx context.Context, id domain.SessionID) {
+	m.mu.Lock()
+	observer := m.terminationObserver
+	m.mu.Unlock()
+	if observer != nil {
+		observer.OnSessionTerminated(ctx, id)
+	}
 }
 
 // SetUsageFinalizer wires termination and relaunches to usage collection.
@@ -525,6 +551,7 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 		// runtime reaper must not leave the session's Docker containers behind
 		// just because it never called MarkTerminated directly.
 		m.reapSessionContainers(ctx, id)
+		m.notifyTerminated(ctx, id)
 	}
 	return nil
 }
@@ -1766,6 +1793,9 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 		switch outcome {
 		case terminationApplied, terminationAlreadyApplied:
 			m.reapSessionContainers(ctx, id)
+			if outcome == terminationApplied {
+				m.notifyTerminated(ctx, id)
+			}
 			return nil
 		case terminationLaunchChanged:
 			return fmt.Errorf("lifecycle: runtime launch changed while terminating session %q", id)

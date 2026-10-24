@@ -1238,3 +1238,41 @@ func TestSpawnPrintsDaemonWarningsToStderr(t *testing.T) {
 		t.Fatalf("warning leaked to stdout: %q", out)
 	}
 }
+
+func TestSpawnNestedLimitErrorsPrintDaemonMessage(t *testing.T) {
+	for _, code := range []string{"SPAWN_DEPTH_EXCEEDED", "TOO_MANY_CHILDREN", "TOO_MANY_WORKERS", "TIER_EXCEEDS_PARENT", "INVALID_PARENT"} {
+		t.Run(code, func(t *testing.T) {
+			cfg := setConfigEnv(t)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions/demo-1":
+					_, _ = io.WriteString(w, `{"session":`+sessionJSON("demo-1", "demo", "worker", "idle", false)+`}`)
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/projects/demo":
+					_, _ = io.WriteString(w, `{"status":"ok","project":{"id":"demo","name":"Demo","path":"/repo/demo","config":{"worker":{"agent":"codex"}}}}`)
+				case r.Method == http.MethodPost && r.URL.Path == "/api/v1/agents/readiness/ensure":
+					_, _ = io.WriteString(w, authorizedAgentsJSON("codex"))
+				case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions":
+					w.WriteHeader(http.StatusConflict)
+					_, _ = io.WriteString(w, `{"error":"conflict","code":"`+code+`","message":"limit reached for test"}`)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			t.Cleanup(srv.Close)
+			writeRunFileFor(t, cfg, srv)
+			t.Setenv("AO_SESSION_ID", "demo-1")
+
+			out, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "spawn", "--tier", "fast", "--prompt", "x", "--name", "w")
+			if err == nil {
+				t.Fatalf("expected error, stdout=%s stderr=%s", out, errOut)
+			}
+			if got := err.Error(); !strings.Contains(got, "limit reached for test") || !strings.Contains(got, code) {
+				t.Fatalf("error = %q, want daemon message and code", got)
+			}
+			if got := ExitCode(err); got != 1 {
+				t.Fatalf("exit code = %d, want 1 for %s", got, code)
+			}
+		})
+	}
+}

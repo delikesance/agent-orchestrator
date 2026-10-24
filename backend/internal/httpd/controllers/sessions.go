@@ -2658,7 +2658,10 @@ func orchestratorID(r *http.Request) domain.SessionID {
 
 func parseSessionListFilter(r *http.Request) (sessionsvc.ListFilter, error) {
 	q := r.URL.Query()
-	filter := sessionsvc.ListFilter{ProjectID: domain.ProjectID(q.Get("project"))}
+	filter := sessionsvc.ListFilter{
+		ProjectID:       domain.ProjectID(q.Get("project")),
+		ParentSessionID: domain.SessionID(q.Get("parentSessionId")),
+	}
 	if raw := q.Get("active"); raw != "" {
 		active, err := strconv.ParseBool(raw)
 		if err != nil {

@@ -68,3 +68,10 @@ All paths are under `backend/internal/` unless noted.
 3. Should `--base-parent` ship in v1, or always branch from the project base?
 4. Does the depth-1 worker's own tier come from `Metadata.Tier` (needs worker-tiers question 3 answered yes)?
 5. Should the cap count Chat-mode and hibernated sessions, or only live agent processes?
+
+## Known limits
+- The parent id is not authenticated. `AO_SESSION_ID` can be forged on loopback, so the depth, children-per-parent and tier checks are advisory against a hostile worker. The per-project cap (12 live workers) still applies. A per-session token in the pipeline lot will enforce lineage.
+- Restore bypasses the caps: restoring a terminated session relaunches it without re-checking depth, children or project counts.
+- Legacy workers (rows that predate the lineage columns) read back at depth 0 with no parent and no recorded tier.
+- The kill cascade and the per-parent children cap apply to worker parents only. An orchestrator's workers survive its termination (shutdown, replacement, reaper) and are limited by the per-project cap alone.
+- Shutdown (`SaveAndTeardownAll`) and `RetireForReplacement` never cascade: they set a no-cascade/no-notice context flag so a worker parent saved before its children does not drop their restore markers. Explicit kill and reaper-observed death still cascade. Parent completion notices (status `terminated`, or `done` once per child on `ao report --done`) are best effort, in memory only, and suppressed during a cascade, shutdown and spawn failure.

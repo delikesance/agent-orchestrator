@@ -318,6 +318,9 @@ func (s *Store) PromoteTaskPreparation(ctx context.Context, id domain.SessionID,
 		ProvisionState:     rec.ProvisionState.WithDefault(),
 		ClientRequestID:    rec.ClientRequestID,
 		ClientRequestHash:  rec.ClientRequestHash,
+		ParentSessionID:    string(rec.ParentSessionID),
+		SpawnDepth:         int64(rec.Depth),
+		Tier:               rec.Metadata.Tier,
 		ID:                 id,
 	})
 	if err != nil {
@@ -905,6 +908,48 @@ func (s *Store) ListAllSessions(ctx context.Context) ([]domain.SessionRecord, er
 	return mapListAllSessionsRows(rows), nil
 }
 
+// CountLiveChildSessions counts the non-terminated sessions spawned by parent.
+func (s *Store) CountLiveChildSessions(ctx context.Context, parent domain.SessionID) (int, error) {
+	n, err := s.qr.CountLiveChildSessions(ctx, string(parent))
+	if err != nil {
+		return 0, fmt.Errorf("count live children of %s: %w", parent, err)
+	}
+	return int(n), nil
+}
+
+// ListChildSessions returns every session spawned by parent (live or not),
+// ordered by number. The records carry identity, lifecycle and lineage facts
+// only; load a child with GetSession for the full row.
+func (s *Store) ListChildSessions(ctx context.Context, parent domain.SessionID) ([]domain.SessionRecord, error) {
+	rows, err := s.qr.ListChildSessions(ctx, string(parent))
+	if err != nil {
+		return nil, fmt.Errorf("list children of %s: %w", parent, err)
+	}
+	out := make([]domain.SessionRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, domain.SessionRecord{
+			ID:              r.ID,
+			ProjectID:       projectIDValue(r.ProjectID),
+			IssueID:         r.IssueID,
+			Kind:            r.Kind,
+			Harness:         r.Harness,
+			DisplayName:     r.DisplayName,
+			IsTerminated:    r.IsTerminated,
+			ParentSessionID: domain.SessionID(r.ParentSessionID),
+			Depth:           int(r.SpawnDepth),
+			CreatedAt:       r.CreatedAt,
+			UpdatedAt:       r.UpdatedAt,
+			Revision:        r.Revision,
+			Metadata: domain.SessionMetadata{
+				Branch:        r.Branch,
+				WorkspacePath: r.WorkspacePath,
+				Tier:          r.Tier,
+			},
+		})
+	}
+	return out, nil
+}
+
 // ListChatHibernationCandidates avoids decoding inactive sessions and activity JSON.
 func (s *Store) ListChatHibernationCandidates(ctx context.Context) ([]domain.SessionID, error) {
 	ids, err := s.qr.ListChatHibernationCandidates(ctx)
@@ -977,6 +1022,8 @@ func rowToRecord(row gen.GetSessionRow) domain.SessionRecord {
 		},
 		FirstSignalAt:      nullTimeToTime(row.FirstSignalAt),
 		IsTerminated:       row.IsTerminated,
+		ParentSessionID:    domain.SessionID(row.ParentSessionID),
+		Depth:              int(row.SpawnDepth),
 		HibernatedAt:       nullTimeToTimePtr(row.HibernatedAt),
 		StaleBinary:        staleBinaryFromRow(row),
 		IsPinned:           row.IsPinned,
@@ -1021,6 +1068,7 @@ func rowToRecord(row gen.GetSessionRow) domain.SessionRecord {
 			Model:                            row.Model,
 			Effort:                           row.Effort,
 			Permissions:                      domain.PermissionMode(row.SessionPermissions),
+			Tier:                             row.Tier,
 		},
 		RequestedOutput:   domain.RequestedOutput(row.RequestedOutput),
 		CleanupGeneration: row.CleanupGeneration,
@@ -1151,6 +1199,9 @@ func recordToInsert(rec domain.SessionRecord, num int64) gen.InsertSessionParams
 		Model:                            rec.Metadata.Model,
 		Effort:                           rec.Metadata.Effort,
 		SessionPermissions:               string(rec.Metadata.Permissions),
+		ParentSessionID:                  string(rec.ParentSessionID),
+		SpawnDepth:                       int64(rec.Depth),
+		Tier:                             rec.Metadata.Tier,
 		RequestedOutput:                  string(rec.RequestedOutput),
 		CreatedAt:                        rec.CreatedAt,
 		UpdatedAt:                        rec.UpdatedAt,

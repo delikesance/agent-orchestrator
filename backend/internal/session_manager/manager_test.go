@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -39,7 +40,7 @@ func TestSeedRecordPreservesAutomationRunIdentity(t *testing.T) {
 	rec := seedRecord(ports.SpawnConfig{
 		ProjectID: "scheduled", Kind: domain.KindWorker,
 		AutomationRunID: &runID,
-	}, domain.ProjectConfig{}, time.Date(2026, time.August, 25, 9, 0, 0, 0, time.UTC))
+	}, domain.ProjectConfig{}, time.Date(2026, time.August, 25, 9, 0, 0, 0, time.UTC), 1)
 	if rec.AutomationRunID == nil || *rec.AutomationRunID != runID {
 		t.Fatalf("automation run id = %v, want %q", rec.AutomationRunID, runID)
 	}
@@ -127,6 +128,14 @@ func (f *fakeStore) CreateClientRequestSession(ctx context.Context, rec domain.S
 func (f *fakeStore) GetSessionByClientRequestID(_ context.Context, id string) (domain.SessionRecord, bool, error) {
 	for _, rec := range f.sessions {
 		if id != "" && rec.ClientRequestID == id {
+			return rec, true, nil
+		}
+	}
+	return domain.SessionRecord{}, false, nil
+}
+func (f *fakeStore) GetSessionByAutomationRunID(_ context.Context, id domain.AutomationRunID) (domain.SessionRecord, bool, error) {
+	for _, rec := range f.sessions {
+		if rec.AutomationRunID != nil && *rec.AutomationRunID == id {
 			return rec, true, nil
 		}
 	}
@@ -393,6 +402,25 @@ func (f *fakeStore) ListAllSessions(context.Context) ([]domain.SessionRecord, er
 	for _, r := range f.sessions {
 		out = append(out, r)
 	}
+	return out, nil
+}
+func (f *fakeStore) CountLiveChildSessions(_ context.Context, parent domain.SessionID) (int, error) {
+	n := 0
+	for _, r := range f.sessions {
+		if r.ParentSessionID == parent && !r.IsTerminated {
+			n++
+		}
+	}
+	return n, nil
+}
+func (f *fakeStore) ListChildSessions(_ context.Context, parent domain.SessionID) ([]domain.SessionRecord, error) {
+	var out []domain.SessionRecord
+	for _, r := range f.sessions {
+		if r.ParentSessionID == parent {
+			out = append(out, r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
 }
 func (f *fakeStore) ListChatHibernationCandidates(ctx context.Context) ([]domain.SessionID, error) {

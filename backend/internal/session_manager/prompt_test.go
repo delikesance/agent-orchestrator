@@ -1,6 +1,7 @@
 package sessionmanager
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -389,5 +390,36 @@ func TestBuildSystemPrompt_WorkerNativeReviewFollowsProjectPolicy(t *testing.T) 
 	local := buildSystemPromptText(systemPromptConfig{Role: sessionPromptRoleWorker, Project: promptProject{ID: "mer"}})
 	if strings.Contains(local, "## AO Native Review") {
 		t.Fatalf("a project with no remote has no PRs to review:\n%s", local)
+	}
+}
+
+func TestBuildSystemPrompt_WorkerChildSpawnSection(t *testing.T) {
+	cfg := systemPromptConfig{Role: sessionPromptRoleWorker, Project: promptProject{ID: "mer", Name: "Mercury", DefaultBranch: "main", Path: "/repo/mercury"}}
+	got := buildSystemPromptText(cfg)
+	for _, want := range []string{
+		"## Spawning Small Child Workers",
+		"ao spawn --tier fast --prompt",
+		"ao session ls --children",
+		fmt.Sprintf("at most %d live children", DefaultMaxActiveChildren),
+		fmt.Sprintf("%d live workers", DefaultMaxActiveWorkers),
+		fmt.Sprintf("depth at most %d", DefaultMaxSpawnDepth),
+		"merging the child branch yourself",
+		"higher tier",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("worker prompt missing %q:\n%s", want, got)
+		}
+	}
+	cfg.Depth = DefaultMaxSpawnDepth
+	if got := buildSystemPromptText(cfg); strings.Contains(got, "Spawning Small Child Workers") {
+		t.Fatal("worker at max depth must not see the child spawn section")
+	}
+	cfg.Depth = 1
+	if got := buildSystemPromptText(cfg); !strings.Contains(got, "Spawning Small Child Workers") {
+		t.Fatal("worker below max depth should see the child spawn section")
+	}
+	cfg.Role = sessionPromptRoleOrchestrator
+	if got := buildSystemPromptText(cfg); strings.Contains(got, "Spawning Small Child Workers") {
+		t.Fatal("orchestrator prompt must not carry the worker section")
 	}
 }

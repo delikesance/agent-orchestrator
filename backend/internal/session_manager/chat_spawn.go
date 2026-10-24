@@ -275,6 +275,7 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		ControllerReady: func(started ChatStarted) (ChatControllerCommit, error) {
 			metadata := domain.SessionMetadata{
 				Permissions:       in.record.Metadata.Permissions,
+				Tier:              in.record.Metadata.Tier,
 				Branch:            in.workspace.Branch,
 				WorkspacePath:     in.workspace.Path,
 				WorkspaceRepoPath: in.workspace.RepoPath,

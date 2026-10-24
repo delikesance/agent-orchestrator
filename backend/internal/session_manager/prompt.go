@@ -40,6 +40,9 @@ type systemPromptConfig struct {
 	ProjectRules          string
 	OrchestratorRules     string
 	AdditionalSections    []string
+	// Depth is the session's spawn depth (orchestrator = 0). Zero means
+	// unknown; the worker spawn section then depends on the constant only.
+	Depth int
 }
 
 type projectRulesConfig struct {
@@ -91,6 +94,9 @@ func buildSystemPromptText(cfg systemPromptConfig) string {
 		}
 		if strings.TrimSpace(cfg.Project.Repo) != "" {
 			sections = append(sections, workerNativeReviewPrompt(cfg.Project, orchestratorID != ""))
+		}
+		if section := workerChildSpawnPrompt(cfg.Depth); section != "" {
+			sections = append(sections, section)
 		}
 		sections = append(sections, workerMultiPRPrompt(), workerContainerLabelPrompt(), workerGitIsolationPrompt())
 		if rules := strings.TrimSpace(cfg.ProjectRules); rules != "" {
@@ -358,6 +364,24 @@ Use `+"`ao report`"+` to persist meaningful progress for the active project orch
 %s
 
 %s`, taskSourceRules, parallelHelpRules, repoRules, projectContextSection(project))
+}
+
+// workerChildSpawnPrompt is the opt-in nested-spawn section for workers. It is
+// empty unless nested spawning is enabled and this worker is below the depth
+// cap. depth 0 means the caller does not know the depth (workers are always at
+// depth >= 1), so only the constant gates the section.
+func workerChildSpawnPrompt(depth int) string {
+	if DefaultMaxSpawnDepth < 2 || (depth > 0 && depth >= DefaultMaxSpawnDepth) {
+		return ""
+	}
+	return fmt.Sprintf(`## Spawning Small Child Workers (Optional)
+
+Split work only when a piece is truly independent and tiny; otherwise do it yourself.
+
+- Spawn a child with `+"`ao spawn --tier fast --prompt \"<clear task>\" --name \"<label>\"`"+`. `+"`AO_SESSION_ID`"+` makes this session the parent, and the child branches from the project base branch.
+- A child may not use a higher tier than yours.
+- Caps: at most %d live children per parent, %d live workers per project, and nesting depth at most %d (orchestrator = 0). A refused spawn prints the reason; do not retry around it.
+- Children report back with `+"`ao report`"+`. You integrate their work by merging the child branch yourself; list children with `+"`ao session ls --children`"+`.`, DefaultMaxActiveChildren, DefaultMaxActiveWorkers, DefaultMaxSpawnDepth)
 }
 
 // workerNativeReviewPrompt teaches a worker AO's native reviewer. The project

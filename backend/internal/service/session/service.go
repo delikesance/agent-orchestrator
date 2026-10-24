@@ -65,6 +65,8 @@ type ListFilter struct {
 	Active           *bool
 	OrchestratorOnly bool
 	Fresh            bool
+	// ParentSessionID, when set, keeps only direct children of that session.
+	ParentSessionID domain.SessionID
 }
 
 // commander is the command-side surface Service delegates to: the
@@ -1304,6 +1306,9 @@ func matchesSessionFilter(rec domain.SessionRecord, filter ListFilter) bool {
 	if filter.Fresh && rec.IsTerminated {
 		return false
 	}
+	if filter.ParentSessionID != "" && rec.ParentSessionID != filter.ParentSessionID {
+		return false
+	}
 	return true
 }
 
@@ -1523,6 +1528,16 @@ func mapSessionError(err error) error {
 		return apierr.Invalid("UNSUPPORTED_MODEL", err.Error(), nil)
 	case errors.Is(err, sessionmanager.ErrInvalidTier):
 		return apierr.Invalid("INVALID_TIER", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrSpawnDepthExceeded):
+		return apierr.Conflict("SPAWN_DEPTH_EXCEEDED", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrTooManyChildren):
+		return apierr.Conflict("TOO_MANY_CHILDREN", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrTooManyWorkers):
+		return apierr.Conflict("TOO_MANY_WORKERS", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrTierExceedsParent):
+		return apierr.Conflict("TIER_EXCEEDS_PARENT", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrInvalidParent):
+		return apierr.Conflict("INVALID_PARENT", err.Error(), nil)
 	case errors.Is(err, sessionmanager.ErrTargetAgentUnauthorized):
 		return apierr.Invalid("TARGET_AGENT_UNAUTHORIZED",
 			"The target agent is not authenticated; authenticate it before switching", nil)
